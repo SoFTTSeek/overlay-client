@@ -1,0 +1,33 @@
+{
+  "name": "@softtseek/overlay-client",
+  "version": "0.1.0",
+  "description": "Overlay network client for SoFTTSeek",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest",
+    "lint": "eslint src"
+  },
+  "dependencies": {
+    "@noble/ed25519": "^2.1.0",
+    "@scure/bip39": "^2.0.1",
+    "better-sqlite3": "^11.3.0",
+    "blake3": "^2.1.7",
+    "cbor-x": "^1.5.9",
+    "hyperbee": "^2.19.5",
+    "hypercore": "^10.37.12",
+    "hyperdht": "^6.15.4",
+    "hyperswarm": "^4.7.15",
+    "sodium-native": "^4.1.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^22.0.0",
+    "eslint": "^9.0.0",
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.0"
+  }
+}
