@@ -4,8 +4,7 @@
  */
 
 import * as ed from '@noble/ed25519';
-import { sha512 } from '@noble/hashes/sha512';
-import { sha256 } from '@noble/hashes/sha256';
+import { sha256, sha512 } from '@noble/hashes/sha2.js';
 import * as bip39 from '@scure/bip39';
 import { wordlist } from '@scure/bip39/wordlists/english.js';
 import { bytesToHex, hexToBytes } from '../utils/cbor.js';
