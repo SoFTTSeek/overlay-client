@@ -14,7 +14,7 @@ import type {
   OverlayConfig,
 } from '../types.js';
 import { DEFAULT_CONFIG } from '../types.js';
-import { tokenizeQuery, getRarestToken, calculateTokenScore } from '../publish/tokenizer.js';
+import { tokenizeQuery, tokenizeFilename, getRarestToken, calculateTokenScore } from '../publish/tokenizer.js';
 import { IndexerSelector, getShardForToken, groupTokensByShard } from './sharding.js';
 
 /**
@@ -162,6 +162,14 @@ export class QueryRouter {
       if (!result.response) continue;
 
       for (const item of result.response.results) {
+        // Verify which tokens ACTUALLY match this result's filename
+        const bestProvider = item.providers[0];
+        const filename = bestProvider?.filenameShort || '';
+        const filenameTokens = new Set(tokenizeFilename(filename));
+
+        // Only count tokens that are actually in the filename
+        const verifiedMatches = queryTokens.filter(qt => filenameTokens.has(qt));
+
         const existing = resultMap.get(item.contentHash);
 
         if (existing) {
@@ -175,22 +183,29 @@ export class QueryRouter {
             }
           }
 
-          // Track matched tokens
-          for (const token of result.tokens) {
+          // Add verified matches
+          for (const token of verifiedMatches) {
             existing.matchedTokens.add(token);
           }
         } else {
           resultMap.set(item.contentHash, {
             item: { ...item },
-            matchedTokens: new Set(result.tokens),
+            matchedTokens: new Set(verifiedMatches),
           });
         }
       }
     }
 
-    // Apply AND/min-match semantics
-    // If we have more than 2 tokens, require at least 2 matches
-    const minMatches = queryTokens.length > 2 ? 2 : 1;
+    // Require verified token matches based on query length
+    // Note: Files may be indexed by path tokens we can't verify from filenameShort alone
+    // - 1 token: trust indexer (token may be from path)
+    // - 2-3 tokens: require at least 1 verified match
+    // - 4+ tokens: require at least 2 verified matches
+    const minMatches = queryTokens.length <= 1
+      ? 0  // Trust indexer for single-token (may match path)
+      : queryTokens.length <= 3
+        ? 1
+        : 2;
 
     const filtered = Array.from(resultMap.values())
       .filter(r => r.matchedTokens.size >= minMatches);
@@ -227,6 +242,7 @@ export class QueryRouter {
         id: result.item.contentHash,
         contentHash: result.item.contentHash,
         filename: bestProvider?.filenameShort || 'Unknown',
+        folderPath: bestProvider?.folderPath,
         size: bestProvider?.size || 0,
         ext: bestProvider?.ext || 'other',
         source: 'overlay' as const,
@@ -235,6 +251,10 @@ export class QueryRouter {
           pubKey: p.pubKey,
         })),
         score,
+        bitrate: bestProvider?.bitrate,
+        duration: bestProvider?.duration,
+        width: bestProvider?.width,
+        height: bestProvider?.height,
       };
     });
   }

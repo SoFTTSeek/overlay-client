@@ -379,6 +379,44 @@ export class LocalDatabase {
   }
 
   // ============================================
+  // Browse Operations
+  // ============================================
+
+  /**
+   * Get all files for browse response
+   * Returns all indexed files with privacy-safe relative paths
+   */
+  getAllFiles(): LocalFileEntry[] {
+    const stmt = this.db.prepare(`
+      SELECT path, content_hash, size, mtime, ext, last_published
+      FROM files
+    `);
+    const rows = stmt.all() as any[];
+
+    return rows.map(row => {
+      const tokens = this.getFileTerms(row.content_hash);
+      return {
+        path: row.path,
+        contentHash: row.content_hash,
+        size: row.size,
+        mtime: row.mtime,
+        ext: row.ext as FileExtension,
+        tokens,
+        lastPublished: row.last_published || undefined,
+      };
+    });
+  }
+
+  /**
+   * Get file count
+   */
+  getFileCount(): number {
+    const stmt = this.db.prepare('SELECT COUNT(*) as count FROM files');
+    const row = stmt.get() as any;
+    return row?.count || 0;
+  }
+
+  // ============================================
   // Hash Cache Operations
   // ============================================
 

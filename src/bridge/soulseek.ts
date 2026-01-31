@@ -10,12 +10,17 @@ import type {
   SearchResult,
   TransferProgress,
   TransferStatus,
+  OverlayBrowseFile,
+  BrowseResponseMessage,
 } from '../types.js';
 import { QueryRouter } from '../search/query.js';
 import { DirectTransport } from '../transport/direct.js';
 import { RelayTransport } from '../transport/relay.js';
 import { ReputationManager, TransferOutcome } from '../reputation/index.js';
 import { PresenceBeacon } from '../presence/beacon.js';
+import { BrowseManager } from '../browse/manager.js';
+import { LocalDatabase } from '../localdb/index.js';
+import { IdentityManager } from '../identity/index.js';
 
 /**
  * Transfer ladder step
@@ -82,13 +87,23 @@ export interface UnifiedSearchResult {
   // Overlay-specific
   contentHash?: ContentHash;
   overlayProviders?: Array<{ pubKey: PublicKeyHex }>;
+  /** Parent folder name (privacy-safe, from overlay) */
+  folderPath?: string;
 
   // Soulseek-specific
   soulseekUsername?: string;
   soulseekPath?: string;
-  bitrate?: number;
-  duration?: number;
   uploadSpeed?: number;
+
+  // Media metadata (from overlay or soulseek)
+  /** Audio bitrate in bits per second (e.g., 320000 for 320kbps) */
+  bitrate?: number;
+  /** Duration in seconds */
+  duration?: number;
+  /** Video width in pixels */
+  width?: number;
+  /** Video height in pixels */
+  height?: number;
 
   // Computed
   score: number;
@@ -123,7 +138,13 @@ export class SoulseekBridge extends EventEmitter {
   private relayTransport: RelayTransport | null = null;
   private reputation: ReputationManager | null = null;
   private beacon: PresenceBeacon | null = null;
+  private browseManager: BrowseManager | null = null;
   private activeTransfers: Map<string, TransferState> = new Map();
+  private pendingBrowses: Map<string, {
+    resolve: (files: OverlayBrowseFile[]) => void;
+    reject: (error: Error) => void;
+    timeout: NodeJS.Timeout;
+  }> = new Map();
   private initialized = false;
 
   constructor(config: Partial<BridgeConfig> = {}) {
@@ -139,6 +160,8 @@ export class SoulseekBridge extends EventEmitter {
     indexerUrls: string[];
     dbPath: string;
     soulseekCallbacks?: SoulseekBridgeCallbacks;
+    identity?: IdentityManager;
+    localDb?: LocalDatabase;
   }): Promise<void> {
     // Initialize overlay components
     this.queryRouter = new QueryRouter(options.indexerUrls);
@@ -146,6 +169,21 @@ export class SoulseekBridge extends EventEmitter {
     this.relayTransport = new RelayTransport(this.config.relayUrls);
     this.reputation = new ReputationManager(options.dbPath);
     this.beacon = new PresenceBeacon(options.myPubKey);
+
+    // Initialize browse manager if identity and localDb provided
+    if (options.identity && options.localDb) {
+      this.browseManager = new BrowseManager(options.identity, options.localDb);
+
+      // Set up browse request handler
+      this.directTransport.setBrowseRequestHandler((msg) => {
+        return this.browseManager?.handleBrowseRequest(msg) || null;
+      });
+
+      // Set up browse response handler
+      this.directTransport.on('browse:response', (response: BrowseResponseMessage) => {
+        this.handleBrowseResponse(response);
+      });
+    }
 
     // Initialize transports
     await this.directTransport.initialize();
@@ -217,8 +255,14 @@ export class SoulseekBridge extends EventEmitter {
         overlayProviders: r.providers
           .filter(p => p.pubKey !== undefined)
           .map(p => ({ pubKey: p.pubKey as string })),
+        folderPath: r.folderPath,
         score: r.score,
         connectionQuality: this.determineConnectionQuality(r),
+        // Include media metadata from overlay results
+        bitrate: r.bitrate,
+        duration: r.duration,
+        width: r.width,
+        height: r.height,
       });
     }
 
@@ -601,6 +645,79 @@ export class SoulseekBridge extends EventEmitter {
   updateIndexerUrls(urls: string[]): void {
     if (this.queryRouter) {
       this.queryRouter.updateIndexers(urls);
+    }
+  }
+
+  /**
+   * Browse an overlay provider's files
+   */
+  async browseOverlay(providerPubKey: PublicKeyHex): Promise<OverlayBrowseFile[]> {
+    if (!this.initialized || !this.directTransport || !this.browseManager) {
+      throw new Error('Bridge not initialized or browse not available');
+    }
+
+    return new Promise(async (resolve, reject) => {
+      const browseId = `browse:${providerPubKey}:${Date.now()}`;
+
+      // Set up timeout
+      const timeout = setTimeout(() => {
+        this.pendingBrowses.delete(browseId);
+        reject(new Error('Browse request timed out'));
+      }, 30000);
+
+      this.pendingBrowses.set(browseId, { resolve, reject, timeout });
+
+      try {
+        // Create and send browse request
+        const request = this.browseManager!.createBrowseRequest();
+        await this.directTransport!.sendBrowseRequest(providerPubKey, request);
+      } catch (err) {
+        clearTimeout(timeout);
+        this.pendingBrowses.delete(browseId);
+        reject(err);
+      }
+    });
+  }
+
+  /**
+   * Handle incoming browse response
+   */
+  private handleBrowseResponse(response: BrowseResponseMessage): void {
+    // Find pending browse for this provider
+    for (const [browseId, pending] of this.pendingBrowses) {
+      if (browseId.includes(response.providerPubKey)) {
+        // Verify signature
+        const signableData = Buffer.from(JSON.stringify({
+          type: 'BROWSE_RESPONSE',
+          providerPubKey: response.providerPubKey,
+          ts: response.ts,
+          files: response.files,
+        }));
+
+        // Use static verify method from IdentityManager
+        const { IdentityManager } = require('../identity/index.js');
+        if (!IdentityManager.verify(signableData, response.sig, response.providerPubKey)) {
+          pending.reject(new Error('Invalid browse response signature'));
+          clearTimeout(pending.timeout);
+          this.pendingBrowses.delete(browseId);
+          return;
+        }
+
+        // Check timestamp is recent (within 5 minutes)
+        const now = Date.now();
+        if (Math.abs(now - response.ts) > 5 * 60 * 1000) {
+          pending.reject(new Error('Browse response timestamp invalid'));
+          clearTimeout(pending.timeout);
+          this.pendingBrowses.delete(browseId);
+          return;
+        }
+
+        // Success - resolve with files
+        pending.resolve(response.files);
+        clearTimeout(pending.timeout);
+        this.pendingBrowses.delete(browseId);
+        return;
+      }
     }
   }
 }

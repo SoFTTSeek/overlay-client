@@ -6,6 +6,7 @@
 import { readdirSync, statSync } from 'fs';
 import { readdir, stat } from 'fs/promises';
 import { join, basename, dirname, extname } from 'path';
+import { parseFile } from 'music-metadata';
 
 import type {
   ContentHash,
@@ -92,7 +93,7 @@ export class Publisher {
   }
 
   /**
-   * Index a single file - hash, tokenize, and store locally
+   * Index a single file - hash, tokenize, extract metadata, and store locally
    */
   async indexFile(scanResult: ScanResult): Promise<LocalFileEntry> {
     // Hash the file
@@ -105,6 +106,30 @@ export class Publisher {
       scanResult.ext
     );
 
+    // Extract parent folder name (privacy-safe - just the folder name, not full path)
+    const folderPath = basename(dirname(scanResult.path));
+
+    // Extract media metadata (bitrate, duration, resolution)
+    let bitrate: number | undefined;
+    let duration: number | undefined;
+    let width: number | undefined;
+    let height: number | undefined;
+
+    try {
+      const metadata = await parseFile(scanResult.path);
+      bitrate = metadata.format.bitrate;
+      duration = metadata.format.duration;
+
+      // Video resolution - check native format properties first
+      const format = metadata.format as any;
+      if (format.width && format.height) {
+        width = format.width;
+        height = format.height;
+      }
+    } catch {
+      // Not a media file or unreadable - that's OK
+    }
+
     const entry: LocalFileEntry = {
       path: scanResult.path,
       contentHash,
@@ -112,6 +137,11 @@ export class Publisher {
       mtime: scanResult.mtime,
       ext: scanResult.ext,
       tokens: tokenResult.tokens,
+      folderPath,
+      bitrate,
+      duration,
+      width,
+      height,
     };
 
     // Store in local DB
@@ -150,6 +180,11 @@ export class Publisher {
       size: entry.size,
       ext: entry.ext,
       filenameShort,
+      folderPath: entry.folderPath,
+      bitrate: entry.bitrate,
+      duration: entry.duration,
+      width: entry.width,
+      height: entry.height,
     }));
   }
 

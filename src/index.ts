@@ -57,7 +57,12 @@ export {
   truncateFilename,
   type TokenizationResult,
 } from './publish/tokenizer.js';
-export { Publisher } from './publish/publisher.js';
+export {
+  Publisher,
+  verifyPublishMessage,
+  verifyRefreshMessage,
+  verifyTombstoneMessage,
+} from './publish/publisher.js';
 
 // Transport
 export { DirectTransport } from './transport/direct.js';
@@ -74,3 +79,6 @@ export { LocalDatabase } from './localdb/index.js';
 
 // Profile cache
 export { ProfileCache } from './profile/cache.js';
+
+// Browse
+export { BrowseManager } from './browse/manager.js';

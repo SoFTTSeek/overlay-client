@@ -15,6 +15,8 @@ import type {
   TransferMetadata,
   TransferProgress,
   TransferStatus,
+  BrowseRequestMessage,
+  BrowseResponseMessage,
 } from '../types.js';
 import { StreamingHasher, verifyFileHash } from '../publish/hasher.js';
 import { bytesToHex, hexToBytes } from '../utils/cbor.js';
@@ -27,7 +29,9 @@ type TransferMessageType =
   | 'METADATA'
   | 'DATA'
   | 'ERROR'
-  | 'COMPLETE';
+  | 'COMPLETE'
+  | 'BROWSE_REQUEST'
+  | 'BROWSE_RESPONSE';
 
 interface TransferMessage {
   type: TransferMessageType;
@@ -36,6 +40,9 @@ interface TransferMessage {
   chunk?: Buffer;
   chunkIndex?: number;
   error?: string;
+  // Browse-specific fields
+  browseRequest?: BrowseRequestMessage;
+  browseResponse?: BrowseResponseMessage;
 }
 
 /**
@@ -78,6 +85,11 @@ interface TransferState {
 }
 
 /**
+ * Browse request handler function type
+ */
+type BrowseRequestHandler = (msg: BrowseRequestMessage) => BrowseResponseMessage | null;
+
+/**
  * Direct transport for P2P file transfers
  */
 export class DirectTransport extends EventEmitter {
@@ -87,6 +99,7 @@ export class DirectTransport extends EventEmitter {
   private myPubKey?: PublicKeyHex;
   private providerTopic: Buffer | null = null;
   private providerTopicJoined = false;
+  private browseRequestHandler: BrowseRequestHandler | null = null;
 
   constructor(myPubKey?: PublicKeyHex) {
     super();
@@ -262,6 +275,12 @@ export class DirectTransport extends EventEmitter {
         break;
       case 'ERROR':
         this.handleError(socket, msg);
+        break;
+      case 'BROWSE_REQUEST':
+        this.handleBrowseRequest(socket, msg);
+        break;
+      case 'BROWSE_RESPONSE':
+        this.handleBrowseResponse(socket, msg);
         break;
     }
   }
@@ -489,6 +508,90 @@ export class DirectTransport extends EventEmitter {
     };
 
     this.emit('progress', progress);
+  }
+
+  /**
+   * Set browse request handler
+   */
+  setBrowseRequestHandler(handler: BrowseRequestHandler): void {
+    this.browseRequestHandler = handler;
+  }
+
+  /**
+   * Handle browse request (as provider)
+   */
+  private handleBrowseRequest(socket: any, msg: TransferMessage): void {
+    if (!msg.browseRequest) return;
+
+    if (this.browseRequestHandler) {
+      const response = this.browseRequestHandler(msg.browseRequest);
+      if (response) {
+        this.sendMessage(socket, {
+          type: 'BROWSE_RESPONSE',
+          browseResponse: response,
+        });
+      }
+    }
+  }
+
+  /**
+   * Handle browse response (as requester)
+   */
+  private handleBrowseResponse(socket: any, msg: TransferMessage): void {
+    if (!msg.browseResponse) return;
+
+    // Emit event for browse manager to handle
+    this.emit('browse:response', msg.browseResponse);
+  }
+
+  /**
+   * Send a browse request to a provider
+   */
+  async sendBrowseRequest(
+    providerPubKey: PublicKeyHex,
+    request: BrowseRequestMessage
+  ): Promise<void> {
+    if (!this.swarm) {
+      throw new Error('Transport not initialized');
+    }
+
+    // Create topic from provider pubkey
+    const topic = Buffer.from(hexToBytes(providerPubKey));
+
+    return new Promise((resolve, reject) => {
+      // Join the topic as client
+      this.swarm!.join(topic, { client: true, server: false });
+
+      let resolved = false;
+
+      // Use persistent listener that only unregisters after provider match or timeout
+      const connectionHandler = (socket: any, info: any) => {
+        if (resolved) return;
+        if (!info?.publicKey) return;
+
+        const remotePubKey = bytesToHex(info.publicKey).toLowerCase();
+        if (remotePubKey === providerPubKey.toLowerCase()) {
+          resolved = true;
+          this.swarm!.off('connection', connectionHandler);
+          this.sendMessage(socket, {
+            type: 'BROWSE_REQUEST',
+            browseRequest: request,
+          });
+          resolve();
+        }
+      };
+
+      this.swarm!.on('connection', connectionHandler);
+
+      // Timeout after 30 seconds
+      setTimeout(() => {
+        if (!resolved) {
+          resolved = true;
+          this.swarm!.off('connection', connectionHandler);
+          reject(new Error('Browse connection timeout'));
+        }
+      }, 30000);
+    });
   }
 
   /**

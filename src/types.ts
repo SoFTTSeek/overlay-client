@@ -68,6 +68,18 @@ export interface Posting {
 
   /** Signature over canonical CBOR bytes */
   sig: SignatureHex;
+
+  /** Audio bitrate in bits per second (e.g., 320000 for 320kbps) */
+  bitrate?: number;
+
+  /** Duration in seconds */
+  duration?: number;
+
+  /** Video width in pixels */
+  width?: number;
+
+  /** Video height in pixels */
+  height?: number;
 }
 
 /**
@@ -79,6 +91,16 @@ export interface TokenPosting {
   size: number;
   ext: FileExtension;
   filenameShort?: string;
+  /** Parent folder name (privacy-safe, not full path) */
+  folderPath?: string;
+  /** Audio bitrate in bits per second (e.g., 320000 for 320kbps) */
+  bitrate?: number;
+  /** Duration in seconds */
+  duration?: number;
+  /** Video width in pixels */
+  width?: number;
+  /** Video height in pixels */
+  height?: number;
 }
 
 // ============================================
@@ -94,7 +116,9 @@ export type MessageType =
   | 'PRESENCE'
   | 'RELAY_HELLO'
   | 'PROFILE_REQUEST'
-  | 'PROFILE_RESPONSE';
+  | 'PROFILE_RESPONSE'
+  | 'BROWSE_REQUEST'
+  | 'BROWSE_RESPONSE';
 
 /**
  * PUBLISH message - announce files to indexers
@@ -162,7 +186,17 @@ export interface QueryResultItem {
     size: number;
     ext: FileExtension;
     filenameShort?: string;
+    /** Parent folder name (privacy-safe, not full path) */
+    folderPath?: string;
     ts: number;
+    /** Audio bitrate in bits per second */
+    bitrate?: number;
+    /** Duration in seconds */
+    duration?: number;
+    /** Video width in pixels */
+    width?: number;
+    /** Video height in pixels */
+    height?: number;
   }>;
   /** Match score for ranking */
   score: number;
@@ -315,6 +349,16 @@ export interface LocalFileEntry {
   tokens: string[];
   /** Last publish timestamp */
   lastPublished?: number;
+  /** Parent folder name (privacy-safe, not full path) */
+  folderPath?: string;
+  /** Audio bitrate in bits per second (e.g., 320000 for 320kbps) */
+  bitrate?: number;
+  /** Duration in seconds */
+  duration?: number;
+  /** Video width in pixels */
+  width?: number;
+  /** Video height in pixels */
+  height?: number;
 }
 
 /**
@@ -346,6 +390,8 @@ export interface SearchResult {
   contentHash?: ContentHash;
   filename: string;
   path?: string;
+  /** Parent folder name (privacy-safe, not full path) */
+  folderPath?: string;
   size: number;
   ext: FileExtension;
   source: ResultSource;
@@ -357,6 +403,14 @@ export interface SearchResult {
   }>;
   /** Combined ranking score */
   score: number;
+  /** Audio bitrate in bits per second (e.g., 320000 for 320kbps) */
+  bitrate?: number;
+  /** Duration in seconds */
+  duration?: number;
+  /** Video width in pixels */
+  width?: number;
+  /** Video height in pixels */
+  height?: number;
 }
 
 // ============================================
@@ -435,6 +489,55 @@ export const DEFAULT_CONFIG: OverlayConfig = {
 };
 
 // ============================================
+// Browse Types
+// ============================================
+
+/**
+ * File entry for browse response (privacy-safe - relative paths only)
+ */
+export interface OverlayBrowseFile {
+  /** Relative path (privacy-safe, no absolute paths) */
+  path: string;
+  /** Filename */
+  filename: string;
+  /** File size in bytes */
+  size: number;
+  /** BLAKE3 content hash */
+  contentHash: ContentHash;
+  /** File extension */
+  ext: FileExtension;
+  /** Audio bitrate in bits per second */
+  bitrate?: number;
+  /** Duration in seconds */
+  duration?: number;
+  /** Video width in pixels */
+  width?: number;
+  /** Video height in pixels */
+  height?: number;
+}
+
+/**
+ * BROWSE_REQUEST message - request to browse a provider's files
+ */
+export interface BrowseRequestMessage {
+  type: 'BROWSE_REQUEST';
+  requesterPubKey: PublicKeyHex;
+  ts: number;
+  sig: SignatureHex;
+}
+
+/**
+ * BROWSE_RESPONSE message - response with provider's file list
+ */
+export interface BrowseResponseMessage {
+  type: 'BROWSE_RESPONSE';
+  providerPubKey: PublicKeyHex;
+  ts: number;
+  files: OverlayBrowseFile[];
+  sig: SignatureHex;
+}
+
+// ============================================
 // Union Types for Message Handling
 // ============================================
 
@@ -450,6 +553,8 @@ export type PeerMessage =
   | PresenceMessage
   | ProfileRequestMessage
   | ProfileResponseMessage
-  | RelayHelloMessage;
+  | RelayHelloMessage
+  | BrowseRequestMessage
+  | BrowseResponseMessage;
 
 export type AnyMessage = IndexerMessage | IndexerResponse | PeerMessage;
