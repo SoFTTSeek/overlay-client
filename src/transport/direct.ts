@@ -523,6 +523,8 @@ export class DirectTransport extends EventEmitter {
   private handleBrowseRequest(socket: any, msg: TransferMessage): void {
     if (!msg.browseRequest) return;
 
+    console.log('Received browse request from:', msg.browseRequest.requesterPubKey?.slice(0, 16));
+
     if (this.browseRequestHandler) {
       const response = this.browseRequestHandler(msg.browseRequest);
       if (response) {

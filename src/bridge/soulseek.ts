@@ -649,6 +649,24 @@ export class SoulseekBridge extends EventEmitter {
   }
 
   /**
+   * Register a file we can provide for P2P transfers
+   */
+  registerProvidedFile(contentHash: ContentHash, filePath: string): void {
+    if (this.directTransport) {
+      this.directTransport.registerFile(contentHash, filePath);
+    }
+  }
+
+  /**
+   * Unregister a file from P2P transfers
+   */
+  unregisterProvidedFile(contentHash: ContentHash): void {
+    if (this.directTransport) {
+      this.directTransport.unregisterFile(contentHash);
+    }
+  }
+
+  /**
    * Browse an overlay provider's files
    */
   async browseOverlay(providerPubKey: PublicKeyHex): Promise<OverlayBrowseFile[]> {
