@@ -105,6 +105,11 @@ export class BrowseManager extends EventEmitter {
     const files: OverlayBrowseFile[] = [];
 
     for (const entry of entries) {
+      // Skip 0-byte files (likely deleted/trashed)
+      if (entry.size === 0) {
+        continue;
+      }
+
       // Extract relative path - use last 2 path segments for privacy
       const fullPath = entry.path;
       const pathParts = fullPath.split(/[/\\]/);

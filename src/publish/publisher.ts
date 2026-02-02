@@ -79,7 +79,12 @@ export class Publisher {
           const stats = await stat(fullPath);
           const ext = parseExtension(entry.name);
 
-          // Skip tiny audio/video files (often placeholders or trashed files)
+          // Skip all 0-byte files (likely placeholders or trashed files)
+          if (stats.size === 0) {
+            continue;
+          }
+
+          // Skip tiny audio/video files (often placeholders or corrupted)
           const isAudio = ['mp3','flac','wav','aac','ogg','opus','wma','m4a','aiff'].includes(ext);
           const isVideo = ['mp4','mkv','avi','mov','wmv','webm'].includes(ext);
           if ((isAudio || isVideo) && stats.size < 1024) {
