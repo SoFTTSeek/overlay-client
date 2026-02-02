@@ -38,6 +38,18 @@ interface RelayConnectionState {
 }
 
 /**
+ * Provider registration state
+ */
+interface ProviderRegistrationState {
+  pubKey: string;
+  socket: Socket;
+  relayUrl: string;
+  connected: boolean;
+  reconnectTimer?: NodeJS.Timeout;
+  providedFiles: Map<ContentHash, string>; // contentHash -> filePath
+}
+
+/**
  * Frame format: uint32_be length + payload
  */
 function writeFrame(socket: Socket, data: Buffer): void {
@@ -74,6 +86,8 @@ export class RelayTransport extends EventEmitter {
   private relayUrls: string[];
   private activeConnections: Map<string, RelayConnectionState> = new Map();
   private connectionTimeout: number = 30000;
+  private providerRegistration: ProviderRegistrationState | null = null;
+  private reconnectDelayMs: number = 5000;
 
   constructor(relayUrls: string[]) {
     super();
@@ -99,21 +113,30 @@ export class RelayTransport extends EventEmitter {
 
   /**
    * Connect to a relay server
+   * @param relayUrl - URL of the relay server
+   * @param persistent - If true, disables timeout for long-lived connections (provider mode)
    */
-  private connectToRelay(relayUrl: string): Promise<Socket> {
+  private connectToRelay(relayUrl: string, persistent = false): Promise<Socket> {
     return new Promise((resolve, reject) => {
       const { host, port } = this.parseRelayUrl(relayUrl);
 
       const socket = createConnection({ host, port }, () => {
+        // Disable timeout for persistent connections (providers stay connected)
+        if (persistent) {
+          socket.setTimeout(0);
+        }
         resolve(socket);
       });
 
       socket.on('error', reject);
 
-      socket.setTimeout(this.connectionTimeout, () => {
-        socket.destroy(new Error('Connection timeout'));
-        reject(new Error('Connection timeout'));
-      });
+      // Only set connection timeout for non-persistent connections
+      if (!persistent) {
+        socket.setTimeout(this.connectionTimeout, () => {
+          socket.destroy(new Error('Connection timeout'));
+          reject(new Error('Connection timeout'));
+        });
+      }
     });
   }
 
@@ -365,5 +388,419 @@ export class RelayTransport extends EventEmitter {
    */
   getActiveConnectionCount(): number {
     return this.activeConnections.size;
+  }
+
+  /**
+   * Register as a provider with the relay server
+   * Maintains a persistent connection for receiving file requests
+   */
+  async registerAsProvider(
+    pubKey: string,
+    providedFiles: Map<ContentHash, string>,
+    relayUrl?: string
+  ): Promise<void> {
+    const selectedRelay = relayUrl || this.relayUrls[0];
+    if (!selectedRelay) {
+      throw new Error('No relay servers available');
+    }
+
+    // Clean up existing registration if any
+    if (this.providerRegistration) {
+      this.unregisterProvider();
+    }
+
+    this.providerRegistration = {
+      pubKey,
+      socket: null as any, // Will be set below
+      relayUrl: selectedRelay,
+      connected: false,
+      providedFiles,
+    };
+
+    await this.connectAsProvider();
+  }
+
+  /**
+   * Connect to relay as provider
+   */
+  private async connectAsProvider(): Promise<void> {
+    if (!this.providerRegistration) return;
+
+    try {
+      // Use persistent=true to disable timeout for long-lived provider connections
+      const socket = await this.connectToRelay(this.providerRegistration.relayUrl, true);
+      this.providerRegistration.socket = socket;
+      this.providerRegistration.connected = true;
+
+      // Send PROVIDER_REGISTER
+      const register = {
+        type: 'PROVIDER_REGISTER',
+        pubKey: this.providerRegistration.pubKey,
+      };
+      writeFrame(socket, Buffer.from(JSON.stringify(register)));
+
+      // Set up handlers
+      this.setupProviderSocketHandlers(socket);
+
+      console.log(`Registered as provider with relay: ${this.providerRegistration.pubKey.slice(0, 16)}...`);
+      this.emit('provider:registered', { relayUrl: this.providerRegistration.relayUrl });
+    } catch (err) {
+      console.error('Failed to connect to relay as provider:', err);
+      this.scheduleProviderReconnect();
+    }
+  }
+
+  /**
+   * Set up socket handlers for provider connection
+   */
+  private setupProviderSocketHandlers(socket: Socket): void {
+    let buffer: Buffer = Buffer.alloc(0);
+
+    socket.on('data', async (data: Buffer) => {
+      buffer = Buffer.concat([buffer, data]);
+
+      const { frames, remaining } = parseFrames(buffer);
+      buffer = remaining;
+
+      for (const frame of frames) {
+        await this.handleProviderFrame(socket, frame);
+      }
+    });
+
+    socket.on('error', (err) => {
+      console.error('Provider relay socket error:', err);
+    });
+
+    socket.on('close', () => {
+      if (this.providerRegistration) {
+        this.providerRegistration.connected = false;
+        console.log('Provider relay connection closed, reconnecting...');
+        this.scheduleProviderReconnect();
+      }
+    });
+  }
+
+  /**
+   * Handle a frame received on the provider connection
+   */
+  private async handleProviderFrame(socket: Socket, frame: Buffer): Promise<void> {
+    try {
+      const msg = JSON.parse(frame.toString());
+
+      if (msg.type === 'PROVIDER_REGISTERED') {
+        console.log('Provider registration confirmed by relay');
+        return;
+      }
+
+      if (msg.type === 'FILE_REQUEST' && msg.contentHash && msg.requesterSessionId) {
+        await this.handleRelayFileRequest(socket, msg.contentHash, msg.requesterSessionId);
+        return;
+      }
+    } catch (err) {
+      console.error('Failed to parse provider frame:', err);
+    }
+  }
+
+  /**
+   * Handle a file request received via relay
+   */
+  private async handleRelayFileRequest(
+    socket: Socket,
+    contentHash: ContentHash,
+    requesterSessionId: string
+  ): Promise<void> {
+    if (!this.providerRegistration) return;
+
+    const filePath = this.providerRegistration.providedFiles.get(contentHash);
+    if (!filePath) {
+      // File not available
+      const error = {
+        type: 'ERROR',
+        requesterSessionId,
+        error: 'File not available',
+      };
+      writeFrame(socket, Buffer.from(JSON.stringify(error)));
+      return;
+    }
+
+    try {
+      // Get file stats
+      const stats = await stat(filePath);
+
+      // Send metadata
+      const metadata = {
+        type: 'FILE_RESPONSE',
+        requesterSessionId,
+        contentHash,
+        size: stats.size,
+      };
+      writeFrame(socket, Buffer.from(JSON.stringify(metadata)));
+
+      // Stream file data
+      const stream = createReadStream(filePath, { highWaterMark: 64 * 1024 });
+
+      stream.on('data', (chunk: Buffer | string) => {
+        const bufferChunk = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
+        // Send as DATA frame with session ID
+        const dataMsg = {
+          type: 'DATA',
+          requesterSessionId,
+          chunk: bufferChunk.toString('base64'),
+        };
+        writeFrame(socket, Buffer.from(JSON.stringify(dataMsg)));
+      });
+
+      stream.on('end', () => {
+        const complete = {
+          type: 'COMPLETE',
+          requesterSessionId,
+          contentHash,
+        };
+        writeFrame(socket, Buffer.from(JSON.stringify(complete)));
+      });
+
+      stream.on('error', (err) => {
+        const error = {
+          type: 'ERROR',
+          requesterSessionId,
+          error: err.message,
+        };
+        writeFrame(socket, Buffer.from(JSON.stringify(error)));
+      });
+    } catch (err: any) {
+      const error = {
+        type: 'ERROR',
+        requesterSessionId,
+        error: err.message,
+      };
+      writeFrame(socket, Buffer.from(JSON.stringify(error)));
+    }
+  }
+
+  /**
+   * Schedule a reconnection attempt for provider
+   */
+  private scheduleProviderReconnect(): void {
+    if (!this.providerRegistration) return;
+
+    if (this.providerRegistration.reconnectTimer) {
+      clearTimeout(this.providerRegistration.reconnectTimer);
+    }
+
+    this.providerRegistration.reconnectTimer = setTimeout(() => {
+      if (this.providerRegistration && !this.providerRegistration.connected) {
+        this.connectAsProvider();
+      }
+    }, this.reconnectDelayMs);
+  }
+
+  /**
+   * Unregister as provider
+   */
+  unregisterProvider(): void {
+    if (!this.providerRegistration) return;
+
+    if (this.providerRegistration.reconnectTimer) {
+      clearTimeout(this.providerRegistration.reconnectTimer);
+    }
+
+    if (this.providerRegistration.socket && !this.providerRegistration.socket.destroyed) {
+      this.providerRegistration.socket.destroy();
+    }
+
+    this.providerRegistration = null;
+    this.emit('provider:unregistered');
+  }
+
+  /**
+   * Update the list of files we can provide
+   */
+  updateProvidedFiles(files: Map<ContentHash, string>): void {
+    if (this.providerRegistration) {
+      this.providerRegistration.providedFiles = files;
+    }
+  }
+
+  /**
+   * Check if we're registered as a provider
+   */
+  isProviderRegistered(): boolean {
+    return this.providerRegistration?.connected ?? false;
+  }
+
+  /**
+   * Request a file via relay using pubKey-based routing (new protocol)
+   * This is the new method that uses provider pubKey instead of session ID
+   */
+  async requestFileFromProvider(
+    contentHash: ContentHash,
+    providerPubKey: string,
+    destPath: string,
+    relayUrl?: string
+  ): Promise<boolean> {
+    const selectedRelay = relayUrl || this.relayUrls[0];
+    if (!selectedRelay) {
+      throw new Error('No relay servers available');
+    }
+
+    // Connect to relay
+    const socket = await this.connectToRelay(selectedRelay);
+
+    return new Promise(async (resolve, reject) => {
+      const state: RelayConnectionState = {
+        sessionId: `${providerPubKey}:${contentHash}:${Date.now()}`,
+        role: 'requester',
+        socket,
+        contentHash,
+        destPath,
+        status: 'connecting',
+        bytesTransferred: 0,
+        totalBytes: 0,
+        hasher: new StreamingHasher(),
+        resolve,
+        reject,
+      };
+
+      this.activeConnections.set(state.sessionId, state);
+
+      // Send RELAY_REQUEST (new protocol)
+      const request = {
+        type: 'RELAY_REQUEST',
+        providerPubKey,
+        contentHash,
+      };
+      writeFrame(socket, Buffer.from(JSON.stringify(request)));
+
+      // Set up handlers for receiving file
+      this.setupRequesterSocketHandlers(socket, state);
+
+      // Set timeout with proper cleanup
+      const timeout = setTimeout(async () => {
+        if (state.status === 'connecting' || state.status === 'downloading') {
+          state.status = 'failed';
+          this.activeConnections.delete(state.sessionId);
+
+          // Close the socket to prevent further data handling
+          if (!socket.destroyed) {
+            socket.destroy();
+          }
+
+          // Close write stream if open
+          if (state.writeStream) {
+            state.writeStream.end();
+          }
+
+          // Clean up partial file
+          if (state.destPath) {
+            await unlink(state.destPath).catch(() => {});
+          }
+
+          reject(new Error('Relay transfer timeout'));
+        }
+      }, 120000); // 2 minute timeout for relay transfers
+
+      // Store timeout and socket so we can clear them on success
+      (state as any).timeout = timeout;
+      (state as any).socket = socket;
+    });
+  }
+
+  /**
+   * Set up socket handlers for requester connection
+   */
+  private setupRequesterSocketHandlers(socket: Socket, state: RelayConnectionState): void {
+    let buffer: Buffer = Buffer.alloc(0);
+    let metadataReceived = false;
+
+    socket.on('data', async (data: Buffer) => {
+      buffer = Buffer.concat([buffer, data]);
+
+      const { frames, remaining } = parseFrames(buffer);
+      buffer = remaining;
+
+      for (const frame of frames) {
+        try {
+          const msg = JSON.parse(frame.toString());
+
+          if (msg.type === 'ERROR') {
+            state.status = 'failed';
+            if ((state as any).timeout) clearTimeout((state as any).timeout);
+            this.activeConnections.delete(state.sessionId);
+            state.reject(new Error(msg.error || 'Relay error'));
+            return;
+          }
+
+          if (msg.type === 'FILE_RESPONSE') {
+            metadataReceived = true;
+            state.totalBytes = msg.size;
+            state.status = 'downloading';
+
+            // Create destination directory
+            await mkdir(dirname(state.destPath!), { recursive: true });
+            state.writeStream = createWriteStream(state.destPath!);
+
+            this.emitProgress(state);
+            continue;
+          }
+
+          if (msg.type === 'DATA' && msg.chunk) {
+            if (metadataReceived && state.writeStream) {
+              const chunk = Buffer.from(msg.chunk, 'base64');
+              state.writeStream.write(chunk);
+              state.hasher.update(chunk);
+              state.bytesTransferred += chunk.length;
+              this.emitProgress(state);
+            }
+            continue;
+          }
+
+          if (msg.type === 'COMPLETE') {
+            await this.handleTransferComplete(state);
+            if ((state as any).timeout) clearTimeout((state as any).timeout);
+            return;
+          }
+        } catch {
+          // Not JSON or parse error - ignore
+        }
+      }
+    });
+
+    socket.on('error', async (err) => {
+      state.status = 'failed';
+      if ((state as any).timeout) clearTimeout((state as any).timeout);
+      this.activeConnections.delete(state.sessionId);
+
+      // Close write stream if open
+      if (state.writeStream) {
+        state.writeStream.end();
+      }
+
+      // Clean up partial file
+      if (state.destPath) {
+        await unlink(state.destPath).catch(() => {});
+      }
+
+      state.reject(err);
+    });
+
+    socket.on('close', async () => {
+      if (state.status === 'downloading' || state.status === 'connecting') {
+        state.status = 'failed';
+        if ((state as any).timeout) clearTimeout((state as any).timeout);
+        this.activeConnections.delete(state.sessionId);
+
+        // Close write stream if open
+        if (state.writeStream) {
+          state.writeStream.end();
+        }
+
+        // Clean up partial file
+        if (state.destPath) {
+          await unlink(state.destPath).catch(() => {});
+        }
+
+        state.reject(new Error('Connection closed'));
+      }
+    });
   }
 }

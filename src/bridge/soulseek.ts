@@ -474,33 +474,71 @@ export class SoulseekBridge extends EventEmitter {
 
   /**
    * Try relay transfer
+   * Uses pubKey-based routing where providers maintain persistent relay connections
    */
   private async tryRelayTransfer(state: TransferState): Promise<boolean> {
-    if (!this.relayTransport || !state.result.contentHash) {
+    if (!this.relayTransport || !state.result.contentHash || !state.result.overlayProviders?.length) {
       return false;
     }
 
-    // For relay, we need to coordinate with a provider
-    // This is simplified - in practice, provider would need to connect to relay too
-    try {
-      state.status = 'downloading';
-      this.emitTransferProgress(state);
-
-      // Request file via relay (simplified)
-      const { sessionId, relayUrl } = await this.relayTransport.requestFileViaRelay(
-        state.result.contentHash,
-        state.destPath,
-        this.config.relayUrls[0]
-      );
-
-      // In real implementation, we'd need to signal provider to connect
-      // For now, this assumes provider is already connected
-
-      return true;
-    } catch (err: any) {
-      state.lastError = err.message;
-      return false;
+    // Sort providers by reputation
+    const providers = [...state.result.overlayProviders];
+    if (this.reputation) {
+      const pubKeys = providers.map(p => p.pubKey);
+      const sorted = this.reputation.sortByReputation(pubKeys);
+      providers.sort((a, b) => sorted.indexOf(a.pubKey) - sorted.indexOf(b.pubKey));
     }
+
+    // Try each provider via relay
+    for (const provider of providers) {
+      if (state.attempts >= this.config.maxRetries) break;
+      state.attempts++;
+
+      try {
+        state.status = 'downloading';
+        state.lastError = undefined;
+        this.emitTransferProgress(state);
+
+        console.log(`Attempting relay transfer from provider ${provider.pubKey.slice(0, 16)}...`);
+
+        const startTime = Date.now();
+        const success = await this.relayTransport.requestFileFromProvider(
+          state.result.contentHash,
+          provider.pubKey,
+          state.destPath,
+          this.config.relayUrls[0]
+        );
+
+        const duration = Date.now() - startTime;
+
+        if (success && this.reputation) {
+          this.reputation.recordTransfer(
+            provider.pubKey,
+            state.result.contentHash,
+            'success',
+            state.totalBytes,
+            duration
+          );
+        }
+
+        return success;
+      } catch (err: any) {
+        console.error(`Relay transfer from ${provider.pubKey.slice(0, 16)} failed:`, err.message);
+        state.lastError = err.message;
+
+        if (this.reputation) {
+          this.reputation.recordTransfer(
+            provider.pubKey,
+            state.result.contentHash!,
+            err.message.includes('timeout') ? 'timeout' : 'refused',
+            0,
+            0
+          );
+        }
+      }
+    }
+
+    return false;
   }
 
   /**
@@ -636,6 +674,64 @@ export class SoulseekBridge extends EventEmitter {
     this.config.relayUrls = urls;
     if (this.relayTransport) {
       this.relayTransport.updateRelays(urls);
+    }
+  }
+
+  /**
+   * Register as a provider with the relay server
+   * This enables other peers to download from us via relay when direct fails
+   */
+  async registerWithRelay(): Promise<void> {
+    if (!this.relayTransport || !this.directTransport) {
+      console.log('Cannot register with relay: transport not initialized');
+      return;
+    }
+
+    if (this.config.relayUrls.length === 0) {
+      console.log('Cannot register with relay: no relay URLs configured');
+      return;
+    }
+
+    // Get our pubKey from the direct transport
+    const myPubKey = (this.directTransport as any).myPubKey;
+    if (!myPubKey) {
+      console.log('Cannot register with relay: no pubKey');
+      return;
+    }
+
+    // Get the files we're providing from direct transport
+    const providedFiles = (this.directTransport as any).providedFiles as Map<string, string>;
+    if (!providedFiles || providedFiles.size === 0) {
+      console.log('No files to provide via relay');
+      return;
+    }
+
+    try {
+      await this.relayTransport.registerAsProvider(myPubKey, providedFiles, this.config.relayUrls[0]);
+      console.log(`Registered with relay as provider: ${myPubKey.slice(0, 16)}... (${providedFiles.size} files)`);
+    } catch (err) {
+      console.error('Failed to register with relay:', err);
+    }
+  }
+
+  /**
+   * Unregister from relay server
+   */
+  unregisterFromRelay(): void {
+    if (this.relayTransport) {
+      this.relayTransport.unregisterProvider();
+    }
+  }
+
+  /**
+   * Update the list of files we can provide via relay
+   */
+  updateRelayProvidedFiles(): void {
+    if (!this.relayTransport || !this.directTransport) return;
+
+    const providedFiles = (this.directTransport as any).providedFiles as Map<string, string>;
+    if (providedFiles) {
+      this.relayTransport.updateProvidedFiles(providedFiles);
     }
   }
 
