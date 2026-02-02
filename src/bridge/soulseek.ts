@@ -61,6 +61,7 @@ interface BridgeConfig {
   relayTimeoutMs: number;
   maxRetries: number;
   relayUrls: string[];
+  soulseekFallbackEnabled: boolean;
   bootstrapUrl?: string;
 }
 
@@ -72,6 +73,7 @@ const DEFAULT_CONFIG: BridgeConfig = {
   relayTimeoutMs: 60000,
   maxRetries: 3,
   relayUrls: [],
+  soulseekFallbackEnabled: true,
   bootstrapUrl: undefined,
 };
 
@@ -174,8 +176,13 @@ export class SoulseekBridge extends EventEmitter {
     if (options.identity && options.localDb) {
       this.browseManager = new BrowseManager(options.identity, options.localDb);
 
-      // Set up browse request handler
+      // Set up browse request handler for direct transport
       this.directTransport.setBrowseRequestHandler((msg) => {
+        return this.browseManager?.handleBrowseRequest(msg) || null;
+      });
+
+      // Set up browse request handler for relay transport
+      this.relayTransport.setBrowseRequestHandler((msg) => {
         return this.browseManager?.handleBrowseRequest(msg) || null;
       });
 
@@ -389,7 +396,7 @@ export class SoulseekBridge extends EventEmitter {
       }
 
       // 3. Fall back to Soulseek
-      if (result.soulseekUsername) {
+      if (result.soulseekUsername && this.config.soulseekFallbackEnabled) {
         state.method = 'soulseek';
         success = await this.trySoulseekTransfer(state);
         if (success) {
@@ -678,6 +685,13 @@ export class SoulseekBridge extends EventEmitter {
   }
 
   /**
+   * Enable or disable Soulseek fallback
+   */
+  setSoulseekFallbackEnabled(enabled: boolean): void {
+    this.config.soulseekFallbackEnabled = enabled;
+  }
+
+  /**
    * Register as a provider with the relay server
    * This enables other peers to download from us via relay when direct fails
    */
@@ -764,20 +778,72 @@ export class SoulseekBridge extends EventEmitter {
 
   /**
    * Browse an overlay provider's files
+   * Tries direct P2P first, then falls back to relay if direct fails
    */
   async browseOverlay(providerPubKey: PublicKeyHex): Promise<OverlayBrowseFile[]> {
     if (!this.initialized || !this.directTransport || !this.browseManager) {
       throw new Error('Bridge not initialized or browse not available');
     }
 
+    // Try direct P2P first
+    try {
+      console.log('Overlay browse: Trying direct P2P to', providerPubKey.slice(0, 16));
+      const result = await this.browseOverlayDirect(providerPubKey);
+      console.log('Overlay browse: Direct P2P succeeded with', result.length, 'files');
+      return result;
+    } catch (directErr: any) {
+      console.log('Overlay browse: Direct P2P failed:', directErr.message, '- trying relay');
+    }
+
+    // Fallback to relay
+    if (!this.relayTransport) {
+      throw new Error('Browse failed: Direct P2P failed and relay transport not available');
+    }
+
+    try {
+      console.log('Overlay browse: Trying relay to', providerPubKey.slice(0, 16));
+      const request = this.browseManager!.createBrowseRequest();
+      const response = await this.relayTransport.sendBrowseRequest(providerPubKey, request);
+
+      // Verify signature
+      const signableData = Buffer.from(JSON.stringify({
+        type: 'BROWSE_RESPONSE',
+        providerPubKey: response.providerPubKey,
+        ts: response.ts,
+        files: response.files,
+      }));
+
+      const { IdentityManager } = await import('../identity/index.js');
+      if (!IdentityManager.verify(signableData, response.sig, response.providerPubKey)) {
+        throw new Error('Invalid browse response signature');
+      }
+
+      // Check timestamp is recent (within 5 minutes)
+      const now = Date.now();
+      if (Math.abs(now - response.ts) > 5 * 60 * 1000) {
+        throw new Error('Browse response timestamp invalid');
+      }
+
+      console.log('Overlay browse: Relay succeeded with', response.files.length, 'files');
+      return response.files;
+    } catch (relayErr: any) {
+      console.log('Overlay browse: Relay also failed:', relayErr.message);
+      throw new Error(`Browse failed: Direct P2P and relay both failed. ${relayErr.message}`);
+    }
+  }
+
+  /**
+   * Browse an overlay provider's files via direct P2P
+   */
+  private async browseOverlayDirect(providerPubKey: PublicKeyHex): Promise<OverlayBrowseFile[]> {
     return new Promise(async (resolve, reject) => {
       const browseId = `browse:${providerPubKey}:${Date.now()}`;
 
-      // Set up timeout
+      // Set up timeout - shorter for direct (15s) to allow relay fallback
       const timeout = setTimeout(() => {
         this.pendingBrowses.delete(browseId);
-        reject(new Error('Browse request timed out'));
-      }, 30000);
+        reject(new Error('Direct browse request timed out'));
+      }, 15000);
 
       this.pendingBrowses.set(browseId, { resolve, reject, timeout });
 
