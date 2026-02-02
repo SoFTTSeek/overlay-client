@@ -4,6 +4,7 @@
  */
 
 import { EventEmitter } from 'events';
+import { rename, unlink } from 'fs/promises';
 import type {
   ContentHash,
   PublicKeyHex,
@@ -142,6 +143,8 @@ export class SoulseekBridge extends EventEmitter {
   private beacon: PresenceBeacon | null = null;
   private browseManager: BrowseManager | null = null;
   private activeTransfers: Map<string, TransferState> = new Map();
+  private lastProgressEmit: Map<string, { time: number; status: TransferStatus }> = new Map();
+  private readonly progressEmitIntervalMs = 200;
   private pendingBrowses: Map<string, {
     resolve: (files: OverlayBrowseFile[]) => void;
     reject: (error: Error) => void;
@@ -371,32 +374,21 @@ export class SoulseekBridge extends EventEmitter {
     this.emitTransferProgress(state);
 
     try {
-      // Try transfer ladder: Direct → Relay → Soulseek
+      // Try overlay methods (direct + relay) in parallel for faster startup
+      // First successful method wins, then fall back to Soulseek if both fail
       let success = false;
 
-      // 1. Try direct overlay transfer
-      if (result.contentHash && result.overlayProviders?.length) {
-        state.method = 'direct';
-        success = await this.tryDirectTransfer(state);
-        if (success) {
+      if (result.contentHash) {
+        const overlayResult = await this.tryOverlayTransferParallel(state);
+        if (overlayResult.success) {
+          state.method = overlayResult.method;
           state.status = 'completed';
           this.emitTransferProgress(state);
           return true;
         }
       }
 
-      // 2. Try relay transfer
-      if (result.contentHash && this.config.relayUrls.length > 0) {
-        state.method = 'relay';
-        success = await this.tryRelayTransfer(state);
-        if (success) {
-          state.status = 'completed';
-          this.emitTransferProgress(state);
-          return true;
-        }
-      }
-
-      // 3. Fall back to Soulseek
+      // Fall back to Soulseek if overlay methods failed
       if (result.soulseekUsername && this.config.soulseekFallbackEnabled) {
         state.method = 'soulseek';
         success = await this.trySoulseekTransfer(state);
@@ -414,22 +406,159 @@ export class SoulseekBridge extends EventEmitter {
     } finally {
       // Use transferId (not result.id) since that's what we stored under
       this.activeTransfers.delete(transferId);
+      this.lastProgressEmit.delete(transferId);
     }
   }
 
   /**
-   * Try direct P2P transfer
+   * Try direct and relay transfers in parallel
+   * First successful method wins, avoiding the 30s direct timeout blocking relay
    */
-  private async tryDirectTransfer(state: TransferState): Promise<boolean> {
-    if (!this.directTransport || !state.result.contentHash || !state.result.overlayProviders) {
+  private async tryOverlayTransferParallel(
+    state: TransferState
+  ): Promise<{ success: boolean; method: TransferMethod | null }> {
+    const hasProviders = state.result.overlayProviders?.length;
+    const canDirect =
+      this.directTransport && state.result.contentHash && hasProviders;
+    const canRelay =
+      this.relayTransport && this.config.relayUrls.length > 0 && hasProviders;
+
+    if (!canDirect && !canRelay) {
+      return { success: false, method: null };
+    }
+
+    // Use temp files to avoid write conflicts between parallel transfers
+    const directTempPath = `${state.destPath}.direct.tmp`;
+    const relayTempPath = `${state.destPath}.relay.tmp`;
+
+    // Collect errors from both methods for final error reporting
+    const errors: { method: TransferMethod; error: string }[] = [];
+
+    type TransferResult = {
+      method: TransferMethod;
+      success: boolean;
+      error?: string;
+    };
+    const promises: Promise<TransferResult>[] = [];
+
+    if (canDirect) {
+      promises.push(
+        this.tryDirectTransfer(state, directTempPath)
+          .then((success) => ({
+            method: 'direct' as const,
+            success,
+            error: success ? undefined : state.lastError,
+          }))
+          .catch((err) => ({
+            method: 'direct' as const,
+            success: false,
+            error: err.message,
+          }))
+      );
+    }
+
+    if (canRelay) {
+      promises.push(
+        this.tryRelayTransfer(state, relayTempPath)
+          .then((success) => ({
+            method: 'relay' as const,
+            success,
+            error: success ? undefined : state.lastError,
+          }))
+          .catch((err) => ({
+            method: 'relay' as const,
+            success: false,
+            error: err.message,
+          }))
+      );
+    }
+
+    // Race for first success, but don't reject if one fails
+    return new Promise((resolve) => {
+      let resolved = false;
+      let failCount = 0;
+
+      for (const promise of promises) {
+        promise.then(async (result) => {
+          if (resolved) {
+            // Another method already won - clean up this temp file
+            const tempPath =
+              result.method === 'direct' ? directTempPath : relayTempPath;
+            await unlink(tempPath).catch(() => {});
+            return;
+          }
+
+          if (result.success) {
+            // Move winning temp file to final destination
+            const tempPath =
+              result.method === 'direct' ? directTempPath : relayTempPath;
+            try {
+              await rename(tempPath, state.destPath);
+              // Only mark as resolved AFTER successful rename
+              resolved = true;
+              state.method = result.method;
+              resolve({ success: true, method: result.method });
+            } catch (err: any) {
+              // Rename failed - check if file already exists (other method won)
+              if (err.code === 'EEXIST' || err.code === 'ENOTEMPTY') {
+                // Other method already completed - treat as success
+                await unlink(tempPath).catch(() => {});
+                // Don't resolve here - let the other method's success handler do it
+                return;
+              }
+              // Some other rename error - record it and continue
+              errors.push({ method: result.method, error: err.message });
+              await unlink(tempPath).catch(() => {});
+              failCount++;
+              if (failCount === promises.length) {
+                state.lastError = errors.map((e) => `${e.method}: ${e.error}`).join('; ');
+                resolve({ success: false, method: null });
+              }
+            }
+          } else {
+            // Transfer failed
+            if (result.error) {
+              errors.push({ method: result.method, error: result.error });
+            }
+            failCount++;
+            // Clean up failed temp file
+            const tempPath =
+              result.method === 'direct' ? directTempPath : relayTempPath;
+            await unlink(tempPath).catch(() => {});
+
+            if (failCount === promises.length) {
+              // All methods failed - propagate errors to state
+              state.lastError = errors.map((e) => `${e.method}: ${e.error}`).join('; ');
+              resolve({ success: false, method: null });
+            }
+          }
+        });
+      }
+    });
+  }
+
+  /**
+   * Try direct P2P transfer
+   * @param destPathOverride - Optional path to write to instead of state.destPath (for parallel transfers)
+   */
+  private async tryDirectTransfer(
+    state: TransferState,
+    destPathOverride?: string
+  ): Promise<boolean> {
+    if (
+      !this.directTransport ||
+      !state.result.contentHash ||
+      !state.result.overlayProviders
+    ) {
       return false;
     }
 
+    const writePath = destPathOverride ?? state.destPath;
     const providers = state.result.overlayProviders;
 
     // Sort providers by reputation
     if (this.reputation) {
-      const pubKeys = providers.map(p => p.pubKey);
+      const pubKeys = providers.map((p) => p.pubKey);
       const sorted = this.reputation.sortByReputation(pubKeys);
       providers.sort((a, b) => sorted.indexOf(a.pubKey) - sorted.indexOf(b.pubKey));
     }
@@ -440,6 +569,7 @@ export class SoulseekBridge extends EventEmitter {
       state.attempts++;
 
       try {
+        state.method = 'direct';
         state.status = 'downloading';
         this.emitTransferProgress(state);
 
@@ -447,7 +577,7 @@ export class SoulseekBridge extends EventEmitter {
         const success = await this.directTransport.requestFile(
           state.result.contentHash,
           provider.pubKey,
-          state.destPath
+          writePath
         );
 
         const duration = Date.now() - startTime;
@@ -484,16 +614,26 @@ export class SoulseekBridge extends EventEmitter {
   /**
    * Try relay transfer
    * Uses pubKey-based routing where providers maintain persistent relay connections
+   * @param destPathOverride - Optional path to write to instead of state.destPath (for parallel transfers)
    */
-  private async tryRelayTransfer(state: TransferState): Promise<boolean> {
-    if (!this.relayTransport || !state.result.contentHash || !state.result.overlayProviders?.length) {
+  private async tryRelayTransfer(
+    state: TransferState,
+    destPathOverride?: string
+  ): Promise<boolean> {
+    if (
+      !this.relayTransport ||
+      !state.result.contentHash ||
+      !state.result.overlayProviders?.length
+    ) {
       return false;
     }
+
+    const writePath = destPathOverride ?? state.destPath;
 
     // Sort providers by reputation
     const providers = [...state.result.overlayProviders];
     if (this.reputation) {
-      const pubKeys = providers.map(p => p.pubKey);
+      const pubKeys = providers.map((p) => p.pubKey);
       const sorted = this.reputation.sortByReputation(pubKeys);
       providers.sort((a, b) => sorted.indexOf(a.pubKey) - sorted.indexOf(b.pubKey));
     }
@@ -504,17 +644,20 @@ export class SoulseekBridge extends EventEmitter {
       state.attempts++;
 
       try {
+        state.method = 'relay';
         state.status = 'downloading';
         state.lastError = undefined;
         this.emitTransferProgress(state);
 
-        console.log(`Attempting relay transfer from provider ${provider.pubKey.slice(0, 16)}...`);
+        console.log(
+          `Attempting relay transfer from provider ${provider.pubKey.slice(0, 16)}...`
+        );
 
         const startTime = Date.now();
         const success = await this.relayTransport.requestFileFromProvider(
           state.result.contentHash,
           provider.pubKey,
-          state.destPath,
+          writePath,
           this.config.relayUrls[0]
         );
 
@@ -582,6 +725,27 @@ export class SoulseekBridge extends EventEmitter {
     if (state) {
       state.bytesTransferred = progress.bytesDownloaded;
       state.status = progress.status;
+      // Update method based on which transport is reporting progress
+      // This ensures correct method is shown even during parallel transfers
+      if (progress.transport === 'direct' || progress.transport === 'relay') {
+        state.method = progress.transport;
+      }
+
+      const now = Date.now();
+      const last = this.lastProgressEmit.get(state.id);
+      const statusChanged = !last || last.status !== progress.status;
+      const isTerminal = progress.status === 'completed' || progress.status === 'failed';
+      const shouldEmit =
+        isTerminal ||
+        statusChanged ||
+        !last ||
+        (now - last.time >= this.progressEmitIntervalMs);
+
+      if (!shouldEmit) {
+        return;
+      }
+
+      this.lastProgressEmit.set(state.id, { time: now, status: progress.status });
       this.emitTransferProgress(state);
     }
   }
@@ -694,6 +858,7 @@ export class SoulseekBridge extends EventEmitter {
     state.lastError = 'Cancelled';
     this.emitTransferProgress(state);
     this.activeTransfers.delete(id);
+    this.lastProgressEmit.delete(id);
     return true;
   }
 
