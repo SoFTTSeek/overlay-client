@@ -685,8 +685,9 @@ export class RelayTransport extends EventEmitter {
       throw new Error('No relay servers available');
     }
 
-    // Connect to relay
-    const socket = await this.connectToRelay(selectedRelay);
+    // Connect to relay - use persistent=true to disable the 30s socket timeout
+    // The transfer has its own 120s timeout, we don't want the socket timeout killing it
+    const socket = await this.connectToRelay(selectedRelay, true);
 
     return new Promise(async (resolve, reject) => {
       const state: RelayConnectionState = {
@@ -753,16 +754,29 @@ export class RelayTransport extends EventEmitter {
   private setupRequesterSocketHandlers(socket: Socket, state: RelayConnectionState): void {
     let buffer: Buffer = Buffer.alloc(0);
     let metadataReceived = false;
+    let totalBytesReceived = 0;
+
+    // Log socket events for debugging
+    socket.on('timeout', () => {
+      console.log('Relay requester socket: timeout event');
+    });
 
     socket.on('data', async (data: Buffer) => {
+      totalBytesReceived += data.length;
+      // Log raw data arrival (first 32 bytes in hex for debugging)
+      console.log(`Relay: Received ${data.length} bytes (total: ${totalBytesReceived}), first 32: ${data.subarray(0, 32).toString('hex')}`);
+
       buffer = Buffer.concat([buffer, data]);
 
       const { frames, remaining } = parseFrames(buffer);
+      console.log(`Relay: Parsed ${frames.length} frames, remaining buffer: ${remaining.length} bytes`);
       buffer = remaining;
 
       for (const frame of frames) {
         try {
+          console.log(`Relay: Processing frame of ${frame.length} bytes, starts with: ${frame.subarray(0, 50).toString('utf8').replace(/[^\x20-\x7E]/g, '?')}`);
           const msg = JSON.parse(frame.toString());
+          console.log(`Relay: Parsed message type: ${msg.type}`);
 
           if (msg.type === 'ERROR') {
             state.status = 'failed';
@@ -797,12 +811,14 @@ export class RelayTransport extends EventEmitter {
           }
 
           if (msg.type === 'COMPLETE') {
+            console.log('Relay: Received COMPLETE, handling transfer completion');
             await this.handleTransferComplete(state);
             if ((state as any).timeout) clearTimeout((state as any).timeout);
             return;
           }
-        } catch {
-          // Not JSON or parse error - ignore
+        } catch (err) {
+          // Not JSON or parse error - log for debugging
+          console.log(`Relay: Frame parse error: ${err}, frame length: ${frame.length}, starts with: ${frame.subarray(0, 50).toString('hex')}`);
         }
       }
     });
