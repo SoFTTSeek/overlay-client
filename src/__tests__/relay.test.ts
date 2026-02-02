@@ -1,129 +1,23 @@
 /**
  * Relay Transport Integration Tests
- * Tests end-to-end file transfer via relay server
+ * Tests end-to-end file transfer via ACTUAL production relay server
  */
 
+// Set NODE_ENV before any imports to prevent pino-pretty from loading
+process.env.NODE_ENV = 'production';
+
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { createServer, Socket, Server } from 'net';
 import { writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { randomBytes } from 'crypto';
 import { RelayTransport } from '../transport/relay.js';
 import { hashFile } from '../publish/hasher.js';
+// Import the ACTUAL production relay server
+import { RelayServer } from '@softtseek/overlay-relay';
 
-/**
- * Minimal relay server for testing (mirrors production relay behavior)
- */
-class TestRelayServer {
-  private server: Server | null = null;
-  private providers: Map<string, Socket> = new Map();
-  private sessions: Map<string, { requester: Socket; providerPubKey: string }> = new Map();
-
-  async start(port: number): Promise<void> {
-    return new Promise((resolve) => {
-      this.server = createServer((socket) => this.handleConnection(socket));
-      this.server.listen(port, '127.0.0.1', () => resolve());
-    });
-  }
-
-  async stop(): Promise<void> {
-    if (this.server) {
-      await new Promise<void>((resolve) => this.server!.close(() => resolve()));
-    }
-  }
-
-  getConnectedProviders(): string[] {
-    return Array.from(this.providers.keys());
-  }
-
-  private handleConnection(socket: Socket): void {
-    let buffer = Buffer.alloc(0);
-    let providerPubKey: string | null = null;
-    let isRequester = false;
-    let sessionId: string | null = null;
-
-    socket.on('data', (data) => {
-      buffer = Buffer.concat([buffer, data]);
-
-      while (buffer.length >= 4) {
-        const length = buffer.readUInt32BE(0);
-        if (buffer.length < 4 + length) break;
-
-        const frame = buffer.subarray(4, 4 + length);
-        buffer = buffer.subarray(4 + length);
-
-        try {
-          const msg = JSON.parse(frame.toString());
-
-          // Provider registration
-          if (msg.type === 'PROVIDER_REGISTER' && msg.pubKey) {
-            providerPubKey = msg.pubKey;
-            this.providers.set(msg.pubKey, socket);
-            this.writeFrame(socket, { type: 'PROVIDER_REGISTERED' });
-            continue;
-          }
-
-          // Requester requesting file
-          if (msg.type === 'RELAY_REQUEST' && msg.providerPubKey && msg.contentHash) {
-            isRequester = true;
-            const provider = this.providers.get(msg.providerPubKey);
-            if (!provider || provider.destroyed) {
-              this.writeFrame(socket, { type: 'ERROR', error: 'Provider not connected to relay' });
-              socket.destroy();
-              return;
-            }
-
-            sessionId = `${msg.providerPubKey}:${msg.contentHash}:${Date.now()}`;
-            this.sessions.set(sessionId, { requester: socket, providerPubKey: msg.providerPubKey });
-
-            // Forward FILE_REQUEST to provider
-            this.writeFrame(provider, {
-              type: 'FILE_REQUEST',
-              contentHash: msg.contentHash,
-              requesterSessionId: sessionId,
-            });
-            continue;
-          }
-
-          // Provider responding with FILE_RESPONSE, DATA, COMPLETE, or ERROR
-          if (providerPubKey && msg.requesterSessionId) {
-            const session = this.sessions.get(msg.requesterSessionId);
-            if (session && session.requester && !session.requester.destroyed) {
-              // Forward frame to requester
-              this.writeFrame(session.requester, msg);
-
-              if (msg.type === 'COMPLETE' || msg.type === 'ERROR') {
-                // Clean up session after a delay
-                setTimeout(() => this.sessions.delete(msg.requesterSessionId), 1000);
-              }
-            }
-          }
-        } catch {
-          // Not JSON - ignore
-        }
-      }
-    });
-
-    socket.on('close', () => {
-      if (providerPubKey) {
-        this.providers.delete(providerPubKey);
-      }
-    });
-
-    socket.on('error', () => {});
-  }
-
-  private writeFrame(socket: Socket, data: object): void {
-    const json = Buffer.from(JSON.stringify(data));
-    const header = Buffer.alloc(4);
-    header.writeUInt32BE(json.length, 0);
-    socket.write(Buffer.concat([header, json]));
-  }
-}
-
-describe('RelayTransport Integration', () => {
-  let relayServer: TestRelayServer;
+describe('RelayTransport Integration (Production RelayServer)', () => {
+  let relayServer: RelayServer;
   let relayPort: number;
   let testDir: string;
 
@@ -132,11 +26,11 @@ describe('RelayTransport Integration', () => {
     testDir = join(tmpdir(), `relay-test-${Date.now()}`);
     mkdirSync(testDir, { recursive: true });
 
-    // Start test relay server on random port
+    // Start ACTUAL production relay server on random port
     relayPort = 19000 + Math.floor(Math.random() * 1000);
-    relayServer = new TestRelayServer();
-    await relayServer.start(relayPort);
-  });
+    relayServer = new RelayServer({ port: relayPort, host: '127.0.0.1' });
+    await relayServer.start();
+  }, 30000);
 
   afterAll(async () => {
     if (relayServer) {
@@ -147,7 +41,7 @@ describe('RelayTransport Integration', () => {
     } catch {
       // Ignore cleanup errors
     }
-  }, 30000); // 30 second timeout for cleanup
+  }, 30000);
 
   describe('End-to-End File Transfer', () => {
     it('should transfer a small file (10KB) via relay', async () => {
@@ -169,8 +63,9 @@ describe('RelayTransport Integration', () => {
       await providerRelay.registerAsProvider(providerPubKey, providedFiles);
       await new Promise(resolve => setTimeout(resolve, 200));
 
-      // Verify provider is registered
-      expect(relayServer.getConnectedProviders()).toContain(providerPubKey);
+      // Verify provider is registered with the ACTUAL relay server
+      const connectedProviders = relayServer.getConnectedProviders();
+      expect(connectedProviders).toContain(providerPubKey);
 
       // Create requester and transfer file
       const requesterRelay = new RelayTransport([`127.0.0.1:${relayPort}`]);
@@ -207,6 +102,9 @@ describe('RelayTransport Integration', () => {
       await providerRelay.registerAsProvider(providerPubKey, providedFiles);
       await new Promise(resolve => setTimeout(resolve, 200));
 
+      // Verify with actual relay server
+      expect(relayServer.getConnectedProviders()).toContain(providerPubKey);
+
       const requesterRelay = new RelayTransport([`127.0.0.1:${relayPort}`]);
 
       // Track progress
@@ -231,7 +129,7 @@ describe('RelayTransport Integration', () => {
       expect(progressEvents[progressEvents.length - 1].status).toBe('completed');
 
       providerRelay.unregisterProvider();
-    }, 60000);
+    }, 120000); // 2 minute timeout for large file
 
     it('should fail gracefully when provider is not connected', async () => {
       const contentHash = randomBytes(32).toString('hex');
@@ -254,6 +152,9 @@ describe('RelayTransport Integration', () => {
 
       await providerRelay.registerAsProvider(providerPubKey, providedFiles);
       await new Promise(resolve => setTimeout(resolve, 200));
+
+      // Verify with actual relay server
+      expect(relayServer.getConnectedProviders()).toContain(providerPubKey);
 
       const requesterRelay = new RelayTransport([`127.0.0.1:${relayPort}`]);
       const contentHash = randomBytes(32).toString('hex');
@@ -288,6 +189,7 @@ describe('RelayTransport Integration', () => {
 
       // Verify provider is registered BEFORE transfer
       expect(providerRelay.isProviderRegistered()).toBe(true);
+      expect(relayServer.getConnectedProviders()).toContain(providerPubKey);
 
       const requesterRelay = new RelayTransport([`127.0.0.1:${relayPort}`]);
       const result = await requesterRelay.requestFileFromProvider(
@@ -301,13 +203,14 @@ describe('RelayTransport Integration', () => {
       // CRITICAL: Provider should STILL be registered AFTER transfer
       // This was the original bug - connection closed during streaming
       expect(providerRelay.isProviderRegistered()).toBe(true);
+      expect(relayServer.getConnectedProviders()).toContain(providerPubKey);
 
       // Verify file
       const downloadedContent = readFileSync(destPath);
       expect(downloadedContent.equals(testFileContent)).toBe(true);
 
       providerRelay.unregisterProvider();
-    }, 30000);
+    }, 60000);
 
     it('should allow multiple sequential transfers from same provider', async () => {
       // Create two test files
@@ -330,6 +233,9 @@ describe('RelayTransport Integration', () => {
       await providerRelay.registerAsProvider(providerPubKey, providedFiles);
       await new Promise(resolve => setTimeout(resolve, 200));
 
+      // Verify with actual relay server
+      expect(relayServer.getConnectedProviders()).toContain(providerPubKey);
+
       // First transfer
       const requester1 = new RelayTransport([`127.0.0.1:${relayPort}`]);
       const dest1 = join(testDir, 'multi-1-downloaded.bin');
@@ -337,8 +243,9 @@ describe('RelayTransport Integration', () => {
       expect(result1).toBe(true);
       expect(readFileSync(dest1).equals(file1Content)).toBe(true);
 
-      // Provider should still be connected
+      // Provider should still be connected (check both client and server)
       expect(providerRelay.isProviderRegistered()).toBe(true);
+      expect(relayServer.getConnectedProviders()).toContain(providerPubKey);
 
       // Second transfer
       const requester2 = new RelayTransport([`127.0.0.1:${relayPort}`]);
@@ -349,8 +256,44 @@ describe('RelayTransport Integration', () => {
 
       // Provider should STILL be registered after both transfers
       expect(providerRelay.isProviderRegistered()).toBe(true);
+      expect(relayServer.getConnectedProviders()).toContain(providerPubKey);
 
       providerRelay.unregisterProvider();
     }, 60000);
+  });
+
+  describe('Relay Server Metrics', () => {
+    it('should track session metrics correctly', async () => {
+      const initialMetrics = relayServer.getMetrics();
+
+      const testFilePath = join(testDir, 'metrics-test.bin');
+      const testFileContent = randomBytes(50 * 1024); // 50KB
+      writeFileSync(testFilePath, testFileContent);
+      const contentHash = await hashFile(testFilePath);
+      const destPath = join(testDir, 'metrics-test-downloaded.bin');
+
+      const providerRelay = new RelayTransport([`127.0.0.1:${relayPort}`]);
+      const providerPubKey = randomBytes(32).toString('hex');
+      const providedFiles = new Map<string, string>();
+      providedFiles.set(contentHash, testFilePath);
+
+      await providerRelay.registerAsProvider(providerPubKey, providedFiles);
+      await new Promise(resolve => setTimeout(resolve, 200));
+
+      const requesterRelay = new RelayTransport([`127.0.0.1:${relayPort}`]);
+      await requesterRelay.requestFileFromProvider(contentHash, providerPubKey, destPath);
+
+      // Wait for session cleanup
+      await new Promise(resolve => setTimeout(resolve, 6000));
+
+      const finalMetrics = relayServer.getMetrics();
+
+      // Should have created at least one new session
+      expect(finalMetrics.totalSessions).toBeGreaterThan(initialMetrics.totalSessions);
+      // Should have relayed bytes
+      expect(finalMetrics.totalBytesRelayed).toBeGreaterThan(initialMetrics.totalBytesRelayed);
+
+      providerRelay.unregisterProvider();
+    }, 30000);
   });
 });
