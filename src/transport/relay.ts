@@ -51,11 +51,12 @@ interface ProviderRegistrationState {
 
 /**
  * Frame format: uint32_be length + payload
+ * Returns true if the write was successful and the buffer is not full
  */
-function writeFrame(socket: Socket, data: Buffer): void {
+function writeFrame(socket: Socket, data: Buffer): boolean {
   const header = Buffer.alloc(4);
   header.writeUInt32BE(data.length, 0);
-  socket.write(Buffer.concat([header, data]));
+  return socket.write(Buffer.concat([header, data]));
 }
 
 /**
@@ -468,7 +469,8 @@ export class RelayTransport extends EventEmitter {
     });
 
     socket.on('error', (err) => {
-      console.error('Provider relay socket error:', err);
+      console.error('Provider relay socket error:', err.message);
+      // Don't trigger reconnect here - 'close' event will handle it
     });
 
     socket.on('close', () => {
@@ -477,6 +479,11 @@ export class RelayTransport extends EventEmitter {
         console.log('Provider relay connection closed, reconnecting...');
         this.scheduleProviderReconnect();
       }
+    });
+
+    // Handle drain event for logging purposes
+    socket.on('drain', () => {
+      console.log('Provider socket drained, buffer cleared');
     });
   }
 
@@ -537,6 +544,7 @@ export class RelayTransport extends EventEmitter {
     try {
       // Get file stats
       const stats = await stat(filePath);
+      console.log('Relay FILE_REQUEST: File size', stats.size, 'bytes');
 
       // Send metadata
       const metadata = {
@@ -545,23 +553,44 @@ export class RelayTransport extends EventEmitter {
         contentHash,
         size: stats.size,
       };
-      writeFrame(socket, Buffer.from(JSON.stringify(metadata)));
+      const metadataWritten = writeFrame(socket, Buffer.from(JSON.stringify(metadata)));
+      console.log('Relay FILE_REQUEST: Sent metadata for session', requesterSessionId.slice(0, 16), 'buffered:', !metadataWritten);
 
-      // Stream file data
-      const stream = createReadStream(filePath, { highWaterMark: 64 * 1024 });
+      // Use smaller chunks to avoid buffer overflow (32KB → ~43KB base64)
+      const stream = createReadStream(filePath, { highWaterMark: 32 * 1024 });
+      let chunkCount = 0;
+      let bytesSent = 0;
 
       stream.on('data', (chunk: Buffer | string) => {
         const bufferChunk = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
+        chunkCount++;
+        bytesSent += bufferChunk.length;
+
         // Send as DATA frame with session ID
         const dataMsg = {
           type: 'DATA',
           requesterSessionId,
           chunk: bufferChunk.toString('base64'),
         };
-        writeFrame(socket, Buffer.from(JSON.stringify(dataMsg)));
+
+        const canContinue = writeFrame(socket, Buffer.from(JSON.stringify(dataMsg)));
+
+        // Handle backpressure: pause stream if socket buffer is full
+        if (!canContinue) {
+          stream.pause();
+          socket.once('drain', () => {
+            stream.resume();
+          });
+        }
+
+        // Log progress every 10 chunks
+        if (chunkCount % 10 === 0) {
+          console.log(`Relay FILE_REQUEST: Streaming chunk ${chunkCount}, ${bytesSent} bytes sent`);
+        }
       });
 
       stream.on('end', () => {
+        console.log(`Relay FILE_REQUEST: Stream complete, ${chunkCount} chunks, ${bytesSent} bytes total`);
         const complete = {
           type: 'COMPLETE',
           requesterSessionId,
@@ -571,6 +600,7 @@ export class RelayTransport extends EventEmitter {
       });
 
       stream.on('error', (err) => {
+        console.error('Relay FILE_REQUEST: Stream error:', err.message);
         const error = {
           type: 'ERROR',
           requesterSessionId,
@@ -579,6 +609,7 @@ export class RelayTransport extends EventEmitter {
         writeFrame(socket, Buffer.from(JSON.stringify(error)));
       });
     } catch (err: any) {
+      console.error('Relay FILE_REQUEST: Error:', err.message);
       const error = {
         type: 'ERROR',
         requesterSessionId,
