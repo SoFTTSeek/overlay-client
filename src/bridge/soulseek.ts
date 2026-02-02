@@ -588,8 +588,24 @@ export class SoulseekBridge extends EventEmitter {
 
   /**
    * Emit transfer progress event
+   * Includes full metadata (filename, localPath, remotePath, username) so UI can display properly
    */
   private emitTransferProgress(state: TransferState): void {
+    // Build username from source - overlay providers or soulseek username
+    let username: string;
+    if (state.result.soulseekUsername) {
+      username = `soulseek:${state.result.soulseekUsername}`;
+    } else if (state.result.overlayProviders?.[0]?.pubKey) {
+      username = `overlay:${state.result.overlayProviders[0].pubKey}`;
+    } else {
+      username = 'unknown';
+    }
+
+    // Build remotePath from folderPath + filename
+    const remotePath = state.result.folderPath
+      ? `${state.result.folderPath}/${state.result.filename}`
+      : state.result.filename;
+
     this.emit('transfer:progress', {
       id: state.id,
       status: state.status,
@@ -599,6 +615,11 @@ export class SoulseekBridge extends EventEmitter {
       progress: state.totalBytes > 0 ? state.bytesTransferred / state.totalBytes : 0,
       elapsed: Date.now() - state.startTime,
       error: state.lastError,
+      // Include metadata for proper UI display
+      filename: state.result.filename,
+      localPath: state.destPath,
+      remotePath,
+      username,
     });
   }
 
