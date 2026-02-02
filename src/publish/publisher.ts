@@ -323,6 +323,38 @@ export class Publisher {
   }
 
   /**
+   * Remove files no longer present on disk and generate tombstones.
+   */
+  pruneMissingFiles(currentPaths: Set<string>): {
+    removed: ContentHash[];
+    tombstone: TombstoneMessage | null;
+  } {
+    const knownFiles = this.localDb.getAllFiles();
+    const removed: ContentHash[] = [];
+
+    for (const entry of knownFiles) {
+      if (!currentPaths.has(entry.path)) {
+        const contentHash = this.localDb.deleteFile(entry.path);
+        if (contentHash) {
+          removed.push(contentHash);
+        }
+      }
+    }
+
+    const tombstone = removed.length > 0
+      ? this.createTombstoneMessage(removed)
+      : null;
+
+    if (tombstone) {
+      for (const contentHash of removed) {
+        this.localDb.deleteFileTerms(contentHash);
+      }
+    }
+
+    return { removed, tombstone };
+  }
+
+  /**
    * Batch files into publish messages (to stay under payload limits)
    */
   batchForPublish(
