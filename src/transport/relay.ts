@@ -486,6 +486,7 @@ export class RelayTransport extends EventEmitter {
   private async handleProviderFrame(socket: Socket, frame: Buffer): Promise<void> {
     try {
       const msg = JSON.parse(frame.toString());
+      console.log('Provider received frame:', msg.type, msg.contentHash?.slice(0, 16) || '');
 
       if (msg.type === 'PROVIDER_REGISTERED') {
         console.log('Provider registration confirmed by relay');
@@ -493,6 +494,7 @@ export class RelayTransport extends EventEmitter {
       }
 
       if (msg.type === 'FILE_REQUEST' && msg.contentHash && msg.requesterSessionId) {
+        console.log('Relay FILE_REQUEST received for:', msg.contentHash.slice(0, 16));
         await this.handleRelayFileRequest(socket, msg.contentHash, msg.requesterSessionId);
         return;
       }
@@ -509,11 +511,18 @@ export class RelayTransport extends EventEmitter {
     contentHash: ContentHash,
     requesterSessionId: string
   ): Promise<void> {
-    if (!this.providerRegistration) return;
+    if (!this.providerRegistration) {
+      console.log('Relay FILE_REQUEST: No provider registration');
+      return;
+    }
+
+    console.log('Relay FILE_REQUEST: Looking up file', contentHash.slice(0, 16));
+    console.log('Relay FILE_REQUEST: Available files:', Array.from(this.providerRegistration.providedFiles.keys()).map(k => k.slice(0, 16)));
 
     const filePath = this.providerRegistration.providedFiles.get(contentHash);
     if (!filePath) {
       // File not available
+      console.log('Relay FILE_REQUEST: File not found for hash', contentHash.slice(0, 16));
       const error = {
         type: 'ERROR',
         requesterSessionId,
@@ -522,6 +531,8 @@ export class RelayTransport extends EventEmitter {
       writeFrame(socket, Buffer.from(JSON.stringify(error)));
       return;
     }
+
+    console.log('Relay FILE_REQUEST: Found file at', filePath);
 
     try {
       // Get file stats
