@@ -13,6 +13,8 @@ import type {
   TransferStatus,
   RelayHelloMessage,
   RelayRole,
+  BrowseRequestMessage,
+  BrowseResponseMessage,
 } from '../types.js';
 import { StreamingHasher, verifyFileHash } from '../publish/hasher.js';
 import { createWriteStream, createReadStream } from 'fs';
@@ -81,6 +83,11 @@ function parseFrames(buffer: Buffer): { frames: Buffer[]; remaining: Buffer } {
 }
 
 /**
+ * Browse request handler function type
+ */
+type BrowseRequestHandler = (msg: BrowseRequestMessage) => BrowseResponseMessage | null;
+
+/**
  * Relay transport client
  */
 export class RelayTransport extends EventEmitter {
@@ -89,6 +96,7 @@ export class RelayTransport extends EventEmitter {
   private connectionTimeout: number = 30000;
   private providerRegistration: ProviderRegistrationState | null = null;
   private reconnectDelayMs: number = 5000;
+  private browseRequestHandler: BrowseRequestHandler | null = null;
 
   constructor(relayUrls: string[]) {
     super();
@@ -505,8 +513,64 @@ export class RelayTransport extends EventEmitter {
         await this.handleRelayFileRequest(socket, msg.contentHash, msg.requesterSessionId);
         return;
       }
+
+      if (msg.type === 'BROWSE_REQUEST' && msg.browseRequest && msg.requesterSessionId) {
+        console.log('Relay BROWSE_REQUEST received from:', msg.browseRequest.requesterPubKey?.slice(0, 16));
+        await this.handleRelayBrowseRequest(socket, msg.browseRequest, msg.requesterSessionId);
+        return;
+      }
     } catch (err) {
       console.error('Failed to parse provider frame:', err);
+    }
+  }
+
+  /**
+   * Handle a browse request received via relay
+   */
+  private async handleRelayBrowseRequest(
+    socket: Socket,
+    browseRequest: BrowseRequestMessage,
+    requesterSessionId: string
+  ): Promise<void> {
+    console.log('Relay BROWSE_REQUEST: Handling browse from', browseRequest.requesterPubKey?.slice(0, 16));
+
+    if (!this.browseRequestHandler) {
+      console.log('Relay BROWSE_REQUEST: No browse handler registered');
+      const error = {
+        type: 'ERROR',
+        requesterSessionId,
+        error: 'Browse not available',
+      };
+      writeFrame(socket, Buffer.from(JSON.stringify(error)));
+      return;
+    }
+
+    try {
+      const response = this.browseRequestHandler(browseRequest);
+      if (response) {
+        const browseResponse = {
+          type: 'BROWSE_RESPONSE',
+          requesterSessionId,
+          browseResponse: response,
+        };
+        writeFrame(socket, Buffer.from(JSON.stringify(browseResponse)));
+        console.log('Relay BROWSE_REQUEST: Sent response with', response.files?.length || 0, 'files');
+      } else {
+        const error = {
+          type: 'ERROR',
+          requesterSessionId,
+          error: 'Browse request rejected',
+        };
+        writeFrame(socket, Buffer.from(JSON.stringify(error)));
+      }
+    } catch (err: any) {
+      console.error('Relay BROWSE_REQUEST: Error:', err.message);
+      const error = {
+        type: 'ERROR',
+        requesterSessionId,
+        error: err.message,
+      };
+      writeFrame(socket, Buffer.from(JSON.stringify(error)));
     }
   }
 
@@ -754,29 +818,24 @@ export class RelayTransport extends EventEmitter {
   private setupRequesterSocketHandlers(socket: Socket, state: RelayConnectionState): void {
     let buffer: Buffer = Buffer.alloc(0);
     let metadataReceived = false;
-    let totalBytesReceived = 0;
+    let transferStartTime = 0;
+    let lastProgressLogBytes = 0;
+    let lastProgressLogPercent = 0;
+    const PROGRESS_LOG_INTERVAL_BYTES = 5 * 1024 * 1024; // Log every 5MB
+    const PROGRESS_LOG_INTERVAL_PERCENT = 10; // Or every 10%
 
-    // Log socket events for debugging
-    socket.on('timeout', () => {
-      console.log('Relay requester socket: timeout event');
-    });
+    // Extract provider pubkey from session ID for logging
+    const providerPubKey = state.sessionId.split(':')[0] || 'unknown';
 
     socket.on('data', async (data: Buffer) => {
-      totalBytesReceived += data.length;
-      // Log raw data arrival (first 32 bytes in hex for debugging)
-      console.log(`Relay: Received ${data.length} bytes (total: ${totalBytesReceived}), first 32: ${data.subarray(0, 32).toString('hex')}`);
-
       buffer = Buffer.concat([buffer, data]);
 
       const { frames, remaining } = parseFrames(buffer);
-      console.log(`Relay: Parsed ${frames.length} frames, remaining buffer: ${remaining.length} bytes`);
       buffer = remaining;
 
       for (const frame of frames) {
         try {
-          console.log(`Relay: Processing frame of ${frame.length} bytes, starts with: ${frame.subarray(0, 50).toString('utf8').replace(/[^\x20-\x7E]/g, '?')}`);
           const msg = JSON.parse(frame.toString());
-          console.log(`Relay: Parsed message type: ${msg.type}`);
 
           if (msg.type === 'ERROR') {
             state.status = 'failed';
@@ -790,6 +849,11 @@ export class RelayTransport extends EventEmitter {
             metadataReceived = true;
             state.totalBytes = msg.size;
             state.status = 'downloading';
+            transferStartTime = Date.now();
+
+            // Log transfer start with size
+            const sizeMB = (msg.size / 1024 / 1024).toFixed(1);
+            console.log(`Relay: Transfer started - ${sizeMB}MB from ${providerPubKey.slice(0, 8)}`);
 
             // Create destination directory
             await mkdir(dirname(state.destPath!), { recursive: true });
@@ -805,20 +869,39 @@ export class RelayTransport extends EventEmitter {
               state.writeStream.write(chunk);
               state.hasher.update(chunk);
               state.bytesTransferred += chunk.length;
+
+              // Log progress periodically (every 5MB or 10%)
+              const bytesSinceLast = state.bytesTransferred - lastProgressLogBytes;
+              const percentComplete = state.totalBytes > 0
+                ? Math.floor((state.bytesTransferred / state.totalBytes) * 100)
+                : 0;
+              const percentThreshold = Math.floor(percentComplete / PROGRESS_LOG_INTERVAL_PERCENT) * PROGRESS_LOG_INTERVAL_PERCENT;
+
+              if (bytesSinceLast >= PROGRESS_LOG_INTERVAL_BYTES ||
+                  (percentThreshold > lastProgressLogPercent && percentComplete > 0)) {
+                const progressMB = (state.bytesTransferred / 1024 / 1024).toFixed(1);
+                console.log(`Relay: Progress ${percentComplete}% (${progressMB}MB)`);
+                lastProgressLogBytes = state.bytesTransferred;
+                lastProgressLogPercent = percentThreshold;
+              }
+
               this.emitProgress(state);
             }
             continue;
           }
 
           if (msg.type === 'COMPLETE') {
-            console.log('Relay: Received COMPLETE, handling transfer completion');
+            const durationSec = transferStartTime > 0
+              ? ((Date.now() - transferStartTime) / 1000).toFixed(1)
+              : '?';
+            const sizeMB = (state.bytesTransferred / 1024 / 1024).toFixed(1);
+            console.log(`Relay: Transfer complete - ${sizeMB}MB in ${durationSec}s`);
             await this.handleTransferComplete(state);
             if ((state as any).timeout) clearTimeout((state as any).timeout);
             return;
           }
-        } catch (err) {
-          // Not JSON or parse error - log for debugging
-          console.log(`Relay: Frame parse error: ${err}, frame length: ${frame.length}, starts with: ${frame.subarray(0, 50).toString('hex')}`);
+        } catch {
+          // Not JSON or parse error - silently ignore as this is likely binary data
         }
       }
     });
@@ -858,6 +941,96 @@ export class RelayTransport extends EventEmitter {
         }
 
         state.reject(new Error('Connection closed'));
+      }
+    });
+  }
+
+  /**
+   * Set the browse request handler (for provider role)
+   */
+  setBrowseRequestHandler(handler: BrowseRequestHandler): void {
+    this.browseRequestHandler = handler;
+  }
+
+  /**
+   * Send a browse request via relay
+   * Returns a promise that resolves when the browse response is received
+   */
+  async sendBrowseRequest(
+    providerPubKey: PublicKeyHex,
+    browseRequest: BrowseRequestMessage
+  ): Promise<BrowseResponseMessage> {
+    if (this.relayUrls.length === 0) {
+      throw new Error('No relay URLs configured');
+    }
+
+    const selectedRelay = this.relayUrls[0];
+    console.log('Sending browse request via relay to provider:', providerPubKey.slice(0, 16));
+
+    return new Promise(async (resolve, reject) => {
+      try {
+        // Connect to relay - use persistent=true to disable socket timeout
+        const socket = await this.connectToRelay(selectedRelay, true);
+
+        // Set timeout for browse response
+        const timeout = setTimeout(() => {
+          socket.destroy();
+          reject(new Error('Browse request via relay timed out'));
+        }, 30000);
+
+        let buffer = Buffer.alloc(0);
+
+        socket.on('data', (data: Buffer) => {
+          buffer = Buffer.concat([buffer, data]);
+          const { frames, remaining } = parseFrames(buffer);
+          buffer = Buffer.from(remaining);
+
+          for (const frame of frames) {
+            try {
+              const msg = JSON.parse(frame.toString());
+              console.log('Relay browse: Received message type:', msg.type);
+
+              if (msg.type === 'ERROR') {
+                clearTimeout(timeout);
+                socket.destroy();
+                reject(new Error(msg.error || 'Browse request failed'));
+                return;
+              }
+
+              if (msg.type === 'BROWSE_RESPONSE' && msg.browseResponse) {
+                clearTimeout(timeout);
+                socket.destroy();
+                console.log('Relay browse: Received response with', msg.browseResponse.files?.length || 0, 'files');
+                resolve(msg.browseResponse);
+                return;
+              }
+            } catch (err) {
+              console.log('Relay browse: Frame parse error:', err);
+            }
+          }
+        });
+
+        socket.on('error', (err) => {
+          clearTimeout(timeout);
+          reject(err);
+        });
+
+        socket.on('close', () => {
+          clearTimeout(timeout);
+          // Only reject if not already resolved
+        });
+
+        // Send RELAY_BROWSE_REQUEST
+        const request = {
+          type: 'RELAY_BROWSE_REQUEST',
+          providerPubKey,
+          browseRequest,
+        };
+        writeFrame(socket, Buffer.from(JSON.stringify(request)));
+        console.log('Relay browse: Sent RELAY_BROWSE_REQUEST');
+
+      } catch (err) {
+        reject(err);
       }
     });
   }
