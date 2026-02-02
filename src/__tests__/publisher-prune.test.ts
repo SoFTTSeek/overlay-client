@@ -34,10 +34,12 @@ describe('Publisher pruneMissingFiles', () => {
     const localDb = new LocalDatabase(dbPath);
     const publisher = new Publisher(identity, localDb);
 
+    // Use production-realistic file sizes (>1KB for audio files)
+    // Different content ensures different hashes
     const existingFile = join(testDir, 'Existing Song.mp3');
     const missingFile = join(testDir, 'Missing Song.mp3');
-    writeFileSync(existingFile, 'exists');
-    writeFileSync(missingFile, 'missing');
+    writeFileSync(existingFile, 'existing-content-' + 'x'.repeat(2048));
+    writeFileSync(missingFile, 'missing-content-' + 'x'.repeat(2048));
 
     const scanResults = await publisher.scanDirectory(testDir);
     const entries = await publisher.indexFiles(scanResults);

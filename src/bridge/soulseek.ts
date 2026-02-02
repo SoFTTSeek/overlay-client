@@ -412,7 +412,8 @@ export class SoulseekBridge extends EventEmitter {
       this.emitTransferProgress(state);
       return false;
     } finally {
-      this.activeTransfers.delete(result.id);
+      // Use transferId (not result.id) since that's what we stored under
+      this.activeTransfers.delete(transferId);
     }
   }
 
