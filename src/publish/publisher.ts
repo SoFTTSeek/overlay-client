@@ -66,6 +66,9 @@ export class Publisher {
     const entries = await readdir(dirPath, { withFileTypes: true });
 
     for (const entry of entries) {
+      if (entry.name.startsWith('.')) {
+        continue;
+      }
       const fullPath = join(dirPath, entry.name);
 
       if (entry.isDirectory() && recursive) {
@@ -75,6 +78,13 @@ export class Publisher {
         try {
           const stats = await stat(fullPath);
           const ext = parseExtension(entry.name);
+
+          // Skip tiny audio/video files (often placeholders or trashed files)
+          const isAudio = ['mp3','flac','wav','aac','ogg','opus','wma','m4a','aiff'].includes(ext);
+          const isVideo = ['mp4','mkv','avi','mov','wmv','webm'].includes(ext);
+          if ((isAudio || isVideo) && stats.size < 1024) {
+            continue;
+          }
 
           results.push({
             path: fullPath,

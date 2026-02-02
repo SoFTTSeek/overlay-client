@@ -354,9 +354,10 @@ export class SoulseekBridge extends EventEmitter {
       throw new Error('Bridge not initialized');
     }
 
+    const transferId = result.contentHash ?? result.id;
     const state: TransferState = {
-      id: result.id,
-      result,
+      id: transferId,
+      result: { ...result, id: transferId },
       destPath,
       status: 'connecting',
       method: null,
@@ -366,7 +367,7 @@ export class SoulseekBridge extends EventEmitter {
       attempts: 0,
     };
 
-    this.activeTransfers.set(result.id, state);
+    this.activeTransfers.set(transferId, state);
     this.emitTransferProgress(state);
 
     try {
