@@ -21,7 +21,7 @@ import { ReputationManager, TransferOutcome } from '../reputation/index.js';
 import { PresenceBeacon } from '../presence/beacon.js';
 import { BrowseManager } from '../browse/manager.js';
 import { LocalDatabase } from '../localdb/index.js';
-import { IdentityManager } from '../identity/index.js';
+import { IdentityManager, computeFingerprint } from '../identity/index.js';
 
 /**
  * Transfer ladder step
@@ -89,7 +89,7 @@ export interface UnifiedSearchResult {
 
   // Overlay-specific
   contentHash?: ContentHash;
-  overlayProviders?: Array<{ pubKey: PublicKeyHex }>;
+  overlayProviders?: Array<{ pubKey: PublicKeyHex; fingerprint?: string }>;
   /** Parent folder name (privacy-safe, from overlay) */
   folderPath?: string;
 
@@ -264,7 +264,10 @@ export class SoulseekBridge extends EventEmitter {
         contentHash: r.contentHash as ContentHash,
         overlayProviders: r.providers
           .filter(p => p.pubKey !== undefined)
-          .map(p => ({ pubKey: p.pubKey as string })),
+          .map(p => ({
+            pubKey: p.pubKey as string,
+            fingerprint: computeFingerprint(p.pubKey as string),
+          })),
         folderPath: r.folderPath,
         score: r.score,
         connectionQuality: this.determineConnectionQuality(r),
