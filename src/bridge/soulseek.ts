@@ -966,58 +966,128 @@ export class SoulseekBridge extends EventEmitter {
 
   /**
    * Browse an overlay provider's files
-   * Tries direct P2P first, then falls back to relay if direct fails
+   * Tries direct P2P and relay in parallel - first success wins
    */
   async browseOverlay(providerPubKey: PublicKeyHex): Promise<OverlayBrowseFile[]> {
     if (!this.initialized || !this.directTransport || !this.browseManager) {
       throw new Error('Bridge not initialized or browse not available');
     }
 
-    // Try direct P2P first
-    try {
-      console.log('Overlay browse: Trying direct P2P to', providerPubKey.slice(0, 16));
-      const result = await this.browseOverlayDirect(providerPubKey);
-      console.log('Overlay browse: Direct P2P succeeded with', result.length, 'files');
-      return result;
-    } catch (directErr: any) {
-      console.log('Overlay browse: Direct P2P failed:', directErr.message, '- trying relay');
+    const hasRelay = !!this.relayTransport;
+
+    // If no relay, just try direct
+    if (!hasRelay) {
+      console.log('Overlay browse: No relay available, trying direct P2P only');
+      return this.browseOverlayDirect(providerPubKey);
     }
 
-    // Fallback to relay
-    if (!this.relayTransport) {
-      throw new Error('Browse failed: Direct P2P failed and relay transport not available');
+    // Race both methods in parallel - first success wins
+    console.log(
+      'Overlay browse: Trying direct P2P and relay in parallel to',
+      providerPubKey.slice(0, 16)
+    );
+
+    return this.browseOverlayParallel(providerPubKey);
+  }
+
+  /**
+   * Browse using both direct P2P and relay in parallel - first success wins
+   */
+  private async browseOverlayParallel(
+    providerPubKey: PublicKeyHex
+  ): Promise<OverlayBrowseFile[]> {
+    type BrowseResult = {
+      success: boolean;
+      method: 'direct' | 'relay';
+      files?: OverlayBrowseFile[];
+      error?: string;
+    };
+
+    const errors: { method: string; error: string }[] = [];
+
+    // Create promises for both methods
+    const directPromise: Promise<BrowseResult> = this.browseOverlayDirect(providerPubKey)
+      .then((files) => ({ success: true, method: 'direct' as const, files }))
+      .catch((err) => ({ success: false, method: 'direct' as const, error: err.message }));
+
+    const relayPromise: Promise<BrowseResult> = this.browseOverlayRelay(providerPubKey)
+      .then((files) => ({ success: true, method: 'relay' as const, files }))
+      .catch((err) => ({ success: false, method: 'relay' as const, error: err.message }));
+
+    const promises = [directPromise, relayPromise];
+
+    // Race for first success
+    return new Promise((resolve, reject) => {
+      let resolved = false;
+      let failCount = 0;
+
+      for (const promise of promises) {
+        promise.then((result) => {
+          if (resolved) {
+            // Another method already won
+            return;
+          }
+
+          if (result.success && result.files) {
+            resolved = true;
+            console.log(
+              `Overlay browse: ${result.method} won with ${result.files.length} files`
+            );
+            resolve(result.files);
+          } else {
+            // This method failed
+            if (result.error) {
+              errors.push({ method: result.method, error: result.error });
+            }
+            failCount++;
+
+            if (failCount === promises.length) {
+              // All methods failed
+              const errorMsg = errors.map((e) => `${e.method}: ${e.error}`).join('; ');
+              console.log('Overlay browse: All methods failed:', errorMsg);
+              reject(new Error(`Browse failed: ${errorMsg}`));
+            }
+          }
+        });
+      }
+    });
+  }
+
+  /**
+   * Browse via relay transport
+   */
+  private async browseOverlayRelay(
+    providerPubKey: PublicKeyHex
+  ): Promise<OverlayBrowseFile[]> {
+    if (!this.relayTransport || !this.browseManager) {
+      throw new Error('Relay transport or browse manager not available');
     }
 
-    try {
-      console.log('Overlay browse: Trying relay to', providerPubKey.slice(0, 16));
-      const request = this.browseManager!.createBrowseRequest();
-      const response = await this.relayTransport.sendBrowseRequest(providerPubKey, request);
+    const request = this.browseManager.createBrowseRequest();
+    const response = await this.relayTransport.sendBrowseRequest(providerPubKey, request);
 
-      // Verify signature
-      const signableData = Buffer.from(JSON.stringify({
+    // Verify signature
+    const signableData = Buffer.from(
+      JSON.stringify({
         type: 'BROWSE_RESPONSE',
         providerPubKey: response.providerPubKey,
         ts: response.ts,
         files: response.files,
-      }));
+      })
+    );
 
-      const { IdentityManager } = await import('../identity/index.js');
-      if (!IdentityManager.verify(signableData, response.sig, response.providerPubKey)) {
-        throw new Error('Invalid browse response signature');
-      }
-
-      // Check timestamp is recent (within 5 minutes)
-      const now = Date.now();
-      if (Math.abs(now - response.ts) > 5 * 60 * 1000) {
-        throw new Error('Browse response timestamp invalid');
-      }
-
-      console.log('Overlay browse: Relay succeeded with', response.files.length, 'files');
-      return response.files;
-    } catch (relayErr: any) {
-      console.log('Overlay browse: Relay also failed:', relayErr.message);
-      throw new Error(`Browse failed: Direct P2P and relay both failed. ${relayErr.message}`);
+    const { IdentityManager } = await import('../identity/index.js');
+    if (!IdentityManager.verify(signableData, response.sig, response.providerPubKey)) {
+      throw new Error('Invalid browse response signature');
     }
+
+    // Check timestamp is recent (within 5 minutes)
+    const now = Date.now();
+    if (Math.abs(now - response.ts) > 5 * 60 * 1000) {
+      throw new Error('Browse response timestamp invalid');
+    }
+
+    return response.files;
   }
 
   /**
