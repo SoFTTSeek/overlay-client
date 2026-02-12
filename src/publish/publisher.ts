@@ -3,10 +3,10 @@
  * PRD Section 6 - Sharing & Publishing Pipeline
  */
 
-import { readdirSync, statSync } from 'fs';
-import { readdir, stat } from 'fs/promises';
-import { join, basename, dirname, extname } from 'path';
-import { parseFile } from 'music-metadata';
+import { readdirSync, statSync } from "fs";
+import { readdir, stat } from "fs/promises";
+import { join, basename, dirname, extname } from "path";
+import { parseFile } from "music-metadata";
 
 import type {
   ContentHash,
@@ -19,18 +19,18 @@ import type {
   TombstoneMessage,
   LocalFileEntry,
   OverlayConfig,
-} from '../types.js';
-import { DEFAULT_CONFIG } from '../types.js';
+} from "../types.js";
+import { DEFAULT_CONFIG } from "../types.js";
 
-import { IdentityManager } from '../identity/index.js';
-import { LocalDatabase } from '../localdb/index.js';
-import { hashFile } from './hasher.js';
-import { tokenizeFile, parseExtension, truncateFilename } from './tokenizer.js';
+import { IdentityManager } from "../identity/index.js";
+import { LocalDatabase } from "../localdb/index.js";
+import { hashFile } from "./hasher.js";
+import { tokenizeFile, parseExtension, truncateFilename } from "./tokenizer.js";
 import {
   getPublishSignableBytes,
   getRefreshSignableBytes,
   getTombstoneSignableBytes,
-} from '../utils/cbor.js';
+} from "../utils/cbor.js";
 
 /**
  * File scan result
@@ -52,7 +52,7 @@ export class Publisher {
   constructor(
     private identity: IdentityManager,
     private localDb: LocalDatabase,
-    config?: Partial<OverlayConfig>
+    config?: Partial<OverlayConfig>,
   ) {
     this.config = { ...DEFAULT_CONFIG, ...config };
   }
@@ -60,13 +60,16 @@ export class Publisher {
   /**
    * Scan a directory for files
    */
-  async scanDirectory(dirPath: string, recursive: boolean = true): Promise<ScanResult[]> {
+  async scanDirectory(
+    dirPath: string,
+    recursive: boolean = true,
+  ): Promise<ScanResult[]> {
     const results: ScanResult[] = [];
 
     const entries = await readdir(dirPath, { withFileTypes: true });
 
     for (const entry of entries) {
-      if (entry.name.startsWith('.')) {
+      if (entry.name.startsWith(".")) {
         continue;
       }
       const fullPath = join(dirPath, entry.name);
@@ -85,8 +88,20 @@ export class Publisher {
           }
 
           // Skip tiny audio/video files (often placeholders or corrupted)
-          const isAudio = ['mp3','flac','wav','aac','ogg','opus','wma','m4a','aiff'].includes(ext);
-          const isVideo = ['mp4','mkv','avi','mov','wmv','webm'].includes(ext);
+          const isAudio = [
+            "mp3",
+            "flac",
+            "wav",
+            "aac",
+            "ogg",
+            "opus",
+            "wma",
+            "m4a",
+            "aiff",
+          ].includes(ext);
+          const isVideo = ["mp4", "mkv", "avi", "mov", "wmv", "webm"].includes(
+            ext,
+          );
           if ((isAudio || isVideo) && stats.size < 1024) {
             continue;
           }
@@ -118,7 +133,7 @@ export class Publisher {
     const tokenResult = tokenizeFile(
       dirname(scanResult.path),
       scanResult.filename,
-      scanResult.ext
+      scanResult.ext,
     );
 
     // Extract parent folder name (privacy-safe - just the folder name, not full path)
@@ -170,13 +185,44 @@ export class Publisher {
    */
   async indexFiles(scanResults: ScanResult[]): Promise<LocalFileEntry[]> {
     const entries: LocalFileEntry[] = [];
+    const failures = new Map<string, { count: number; samples: string[] }>();
+
+    const summarizeError = (err: unknown): string => {
+      if (err instanceof Error && err.message) {
+        return err.message;
+      }
+      return String(err);
+    };
 
     for (const result of scanResults) {
       try {
         const entry = await this.indexFile(result);
         entries.push(entry);
       } catch (err) {
-        console.error(`Failed to index ${result.path}:`, err);
+        const reason = summarizeError(err);
+        const existing = failures.get(reason);
+        if (existing) {
+          existing.count += 1;
+          if (existing.samples.length < 3) {
+            existing.samples.push(result.path);
+          }
+        } else {
+          failures.set(reason, { count: 1, samples: [result.path] });
+        }
+      }
+    }
+
+    if (failures.size > 0) {
+      const failedCount = scanResults.length - entries.length;
+      console.warn(
+        `[overlay] Failed to index ${failedCount} file(s) across ${failures.size} error type(s)`,
+      );
+
+      for (const [reason, details] of failures) {
+        const examples = details.samples.join(", ");
+        console.warn(
+          `[overlay] ${reason} (${details.count} file(s)); examples: ${examples}`,
+        );
       }
     }
 
@@ -189,7 +235,7 @@ export class Publisher {
   createTokenPostings(entry: LocalFileEntry): TokenPosting[] {
     const filenameShort = truncateFilename(basename(entry.path));
 
-    return entry.tokens.map(token => ({
+    return entry.tokens.map((token) => ({
       token,
       contentHash: entry.contentHash,
       size: entry.size,
@@ -230,7 +276,7 @@ export class Publisher {
     const sig = this.identity.sign(signableBytes);
 
     return {
-      type: 'PUBLISH',
+      type: "PUBLISH",
       providerPubKey,
       ts,
       ttlMs,
@@ -261,7 +307,7 @@ export class Publisher {
     const sig = this.identity.sign(signableBytes);
 
     return {
-      type: 'REFRESH',
+      type: "REFRESH",
       providerPubKey,
       ts,
       ttlMs,
@@ -273,7 +319,9 @@ export class Publisher {
   /**
    * Create a signed TOMBSTONE message for deleted files
    */
-  createTombstoneMessage(contentHashes: ContentHash[]): TombstoneMessage | null {
+  createTombstoneMessage(
+    contentHashes: ContentHash[],
+  ): TombstoneMessage | null {
     const providerPubKey = this.identity.getPublicKey();
     const ts = Date.now();
 
@@ -296,7 +344,7 @@ export class Publisher {
     const sig = this.identity.sign(signableBytes);
 
     return {
-      type: 'TOMBSTONE',
+      type: "TOMBSTONE",
       providerPubKey,
       ts,
       removals,
@@ -356,9 +404,8 @@ export class Publisher {
       }
     }
 
-    const tombstone = removed.length > 0
-      ? this.createTombstoneMessage(removed)
-      : null;
+    const tombstone =
+      removed.length > 0 ? this.createTombstoneMessage(removed) : null;
 
     if (tombstone) {
       for (const contentHash of removed) {
@@ -374,7 +421,7 @@ export class Publisher {
    */
   batchForPublish(
     entries: LocalFileEntry[],
-    maxPostingsPerMessage: number = 1000
+    maxPostingsPerMessage: number = 1000,
   ): PublishMessage[] {
     const messages: PublishMessage[] = [];
     let currentBatch: LocalFileEntry[] = [];
@@ -383,7 +430,10 @@ export class Publisher {
     for (const entry of entries) {
       const postingCount = entry.tokens.length;
 
-      if (currentPostingCount + postingCount > maxPostingsPerMessage && currentBatch.length > 0) {
+      if (
+        currentPostingCount + postingCount > maxPostingsPerMessage &&
+        currentBatch.length > 0
+      ) {
         // Create message for current batch
         messages.push(this.createPublishMessage(currentBatch));
         currentBatch = [];
