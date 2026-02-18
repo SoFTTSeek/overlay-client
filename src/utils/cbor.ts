@@ -11,6 +11,7 @@ import type {
   PresenceMessage,
   Profile,
   TokenPosting,
+  DirectMessage,
 } from '../types.js';
 
 /**
@@ -101,6 +102,81 @@ export function getProfileSignableBytes(profile: Omit<Profile, 'sig'>): Uint8Arr
     ts: profile.ts,
   };
   return encodeCanonical(signable);
+}
+
+/**
+ * Get the signable bytes for a DIRECT_MESSAGE (excludes sig and type fields)
+ */
+export function getDirectMessageSignableBytes(msg: { from: string; to: string; ts: number; contentType: string; payload: string }): Uint8Array {
+  const signable = {
+    from: msg.from,
+    to: msg.to,
+    ts: msg.ts,
+    contentType: msg.contentType,
+    payload: msg.payload,
+  };
+  return encodeCanonical(signable);
+}
+
+/**
+ * Get the signable bytes for a Collection (excludes sig and id fields)
+ */
+export function getCollectionSignableBytes(collection: {
+  name: string;
+  description?: string;
+  providerPubKey: string;
+  items: Array<{ contentHash: string; filename: string; size: number; ext: string; order: number }>;
+  ts: number;
+  ttlMs: number;
+}): Uint8Array {
+  return encodeCanonical({
+    name: collection.name,
+    description: collection.description,
+    providerPubKey: collection.providerPubKey,
+    items: collection.items,
+    ts: collection.ts,
+    ttlMs: collection.ttlMs,
+  });
+}
+
+/**
+ * Get the signable bytes for a reputation report
+ */
+export function getReputationReportSignableBytes(report: {
+  reporterPubKey: string;
+  subjectPubKey: string;
+  outcome: string;
+  bytes: number;
+  durationMs: number;
+  ts: number;
+}): Uint8Array {
+  return encodeCanonical({
+    reporterPubKey: report.reporterPubKey,
+    subjectPubKey: report.subjectPubKey,
+    outcome: report.outcome,
+    bytes: report.bytes,
+    durationMs: report.durationMs,
+    ts: report.ts,
+  });
+}
+
+/**
+ * Get the signable bytes for a download receipt
+ */
+export function getDownloadReceiptSignableBytes(receipt: {
+  contentHash: string;
+  downloaderPubKey: string;
+  providerPubKey: string;
+  ts: number;
+  bytesReceived: number;
+}): Uint8Array {
+  return encodeCanonical({
+    contentHash: receipt.contentHash,
+    downloaderPubKey: receipt.downloaderPubKey,
+    providerPubKey: receipt.providerPubKey,
+    ts: receipt.ts,
+    bytesReceived: receipt.bytesReceived,
+  });
 }
 
 /**

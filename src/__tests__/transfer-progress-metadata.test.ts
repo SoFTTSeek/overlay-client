@@ -15,11 +15,12 @@
  * - Username shows "overlay:unknown"
  * - Reveal in Finder button doesn't work (empty localPath)
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdirSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { SoulseekBridge, UnifiedSearchResult } from '../bridge/soulseek.js';
+import { DirectTransport } from '../transport/direct.js';
 import { IdentityManager } from '../identity/index.js';
 import { LocalDatabase } from '../localdb/index.js';
 
@@ -39,6 +40,7 @@ describe('Transfer progress metadata', () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     try {
       rmSync(testDir, { recursive: true, force: true });
     } catch {
@@ -48,6 +50,10 @@ describe('Transfer progress metadata', () => {
 
   describe('SoulseekBridge progress events should include metadata', () => {
     it('should include filename in progress events', async () => {
+      vi.spyOn(DirectTransport.prototype, 'requestFile').mockRejectedValue(
+        new Error('timeout')
+      );
+
       const identity = new IdentityManager(identityDir);
       await identity.initialize();
       const localDb = new LocalDatabase(dbPath);
@@ -57,6 +63,8 @@ describe('Transfer progress metadata', () => {
         relayUrls: [],
         soulseekFallbackEnabled: false,
         maxRetries: 1,
+        directTimeoutMs: 200,
+        relayTimeoutMs: 200,
       });
 
       await bridge.initialize({
@@ -114,6 +122,10 @@ describe('Transfer progress metadata', () => {
     }, TEST_TIMEOUT);
 
     it('should include localPath in progress events for reveal-in-folder', async () => {
+      vi.spyOn(DirectTransport.prototype, 'requestFile').mockRejectedValue(
+        new Error('timeout')
+      );
+
       const identity = new IdentityManager(identityDir);
       await identity.initialize();
       const localDb = new LocalDatabase(dbPath);
@@ -123,6 +135,8 @@ describe('Transfer progress metadata', () => {
         relayUrls: [],
         soulseekFallbackEnabled: false,
         maxRetries: 1,
+        directTimeoutMs: 200,
+        relayTimeoutMs: 200,
       });
 
       await bridge.initialize({
@@ -171,6 +185,10 @@ describe('Transfer progress metadata', () => {
     }, TEST_TIMEOUT);
 
     it('should include username in progress events for overlay providers', async () => {
+      vi.spyOn(DirectTransport.prototype, 'requestFile').mockRejectedValue(
+        new Error('timeout')
+      );
+
       const identity = new IdentityManager(identityDir);
       await identity.initialize();
       const localDb = new LocalDatabase(dbPath);
@@ -181,6 +199,8 @@ describe('Transfer progress metadata', () => {
         relayUrls: [],
         soulseekFallbackEnabled: false,
         maxRetries: 1,
+        directTimeoutMs: 200,
+        relayTimeoutMs: 200,
       });
 
       await bridge.initialize({
@@ -230,6 +250,10 @@ describe('Transfer progress metadata', () => {
     }, TEST_TIMEOUT);
 
     it('should include remotePath in progress events', async () => {
+      vi.spyOn(DirectTransport.prototype, 'requestFile').mockRejectedValue(
+        new Error('timeout')
+      );
+
       const identity = new IdentityManager(identityDir);
       await identity.initialize();
       const localDb = new LocalDatabase(dbPath);
@@ -239,6 +263,8 @@ describe('Transfer progress metadata', () => {
         relayUrls: [],
         soulseekFallbackEnabled: false,
         maxRetries: 1,
+        directTimeoutMs: 200,
+        relayTimeoutMs: 200,
       });
 
       await bridge.initialize({
@@ -300,6 +326,8 @@ describe('Transfer progress metadata', () => {
         relayUrls: [],
         soulseekFallbackEnabled: true,
         maxRetries: 1,
+        directTimeoutMs: 200,
+        relayTimeoutMs: 200,
       });
 
       await bridge.initialize({

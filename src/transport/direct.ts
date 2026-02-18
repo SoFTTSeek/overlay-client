@@ -17,9 +17,12 @@ import type {
   TransferStatus,
   BrowseRequestMessage,
   BrowseResponseMessage,
+  DirectMessage,
+  DirectMessageAck,
 } from '../types.js';
 import { StreamingHasher, verifyFileHash } from '../publish/hasher.js';
-import { bytesToHex, hexToBytes } from '../utils/cbor.js';
+import { bytesToHex, hexToBytes, getDirectMessageSignableBytes } from '../utils/cbor.js';
+import { IdentityManager } from '../identity/index.js';
 
 /**
  * Transfer message types
@@ -31,7 +34,9 @@ type TransferMessageType =
   | 'ERROR'
   | 'COMPLETE'
   | 'BROWSE_REQUEST'
-  | 'BROWSE_RESPONSE';
+  | 'BROWSE_RESPONSE'
+  | 'DIRECT_MESSAGE'
+  | 'DIRECT_MESSAGE_ACK';
 
 interface TransferMessage {
   type: TransferMessageType;
@@ -43,6 +48,9 @@ interface TransferMessage {
   // Browse-specific fields
   browseRequest?: BrowseRequestMessage;
   browseResponse?: BrowseResponseMessage;
+  // Direct messaging fields
+  directMessage?: DirectMessage;
+  directMessageAck?: DirectMessageAck;
 }
 
 /**
@@ -90,6 +98,11 @@ interface TransferState {
 type BrowseRequestHandler = (msg: BrowseRequestMessage) => BrowseResponseMessage | null;
 
 /**
+ * Direct message handler function type
+ */
+type DirectMessageHandler = (msg: DirectMessage) => void;
+
+/**
  * Direct transport for P2P file transfers
  */
 export class DirectTransport extends EventEmitter {
@@ -100,6 +113,8 @@ export class DirectTransport extends EventEmitter {
   private providerTopic: Buffer | null = null;
   private providerTopicJoined = false;
   private browseRequestHandler: BrowseRequestHandler | null = null;
+  private directMessageHandler: DirectMessageHandler | null = null;
+  private seenMessageIds: Set<string> = new Set();
 
   constructor(myPubKey?: PublicKeyHex) {
     super();
@@ -281,6 +296,12 @@ export class DirectTransport extends EventEmitter {
         break;
       case 'BROWSE_RESPONSE':
         this.handleBrowseResponse(socket, msg);
+        break;
+      case 'DIRECT_MESSAGE':
+        this.handleDirectMessage(socket, msg);
+        break;
+      case 'DIRECT_MESSAGE_ACK':
+        this.handleDirectMessageAck(msg);
         break;
     }
   }
@@ -591,6 +612,148 @@ export class DirectTransport extends EventEmitter {
           resolved = true;
           this.swarm!.off('connection', connectionHandler);
           reject(new Error('Browse connection timeout'));
+        }
+      }, 30000);
+    });
+  }
+
+  /**
+   * Set direct message handler
+   */
+  setDirectMessageHandler(handler: DirectMessageHandler): void {
+    this.directMessageHandler = handler;
+  }
+
+  /**
+   * Handle incoming direct message (as recipient)
+   */
+  private handleDirectMessage(socket: any, msg: TransferMessage): void {
+    if (!msg.directMessage) return;
+
+    const dm = msg.directMessage;
+
+    // Deduplicate by messageId
+    if (this.seenMessageIds.has(dm.messageId)) {
+      // Already processed - send ACK again
+      this.sendMessage(socket, {
+        type: 'DIRECT_MESSAGE_ACK',
+        directMessageAck: {
+          type: 'DIRECT_MESSAGE_ACK',
+          messageId: dm.messageId,
+          status: 'delivered',
+        },
+      });
+      return;
+    }
+
+    // Validate recipient matches us (prevent misdelivery on shared topics)
+    if (this.myPubKey && dm.to && dm.to !== this.myPubKey) {
+      console.log('Direct message not addressed to us, ignoring:', dm.to?.slice(0, 16));
+      return;
+    }
+
+    // Verify signature
+    const signableBytes = getDirectMessageSignableBytes(dm);
+    if (!dm.from || !dm.sig || !IdentityManager.verify(signableBytes, dm.sig, dm.from)) {
+      console.error('Direct message signature verification failed from:', dm.from?.slice(0, 16) ?? 'unknown');
+      this.sendMessage(socket, {
+        type: 'DIRECT_MESSAGE_ACK',
+        directMessageAck: {
+          type: 'DIRECT_MESSAGE_ACK',
+          messageId: dm.messageId,
+          status: 'rejected',
+        },
+      });
+      return;
+    }
+
+    // Mark as seen
+    this.seenMessageIds.add(dm.messageId);
+
+    // Limit seen set size to prevent memory leak
+    if (this.seenMessageIds.size > 10000) {
+      const first = this.seenMessageIds.values().next().value;
+      if (first) this.seenMessageIds.delete(first);
+    }
+
+    // Call handler
+    if (this.directMessageHandler) {
+      this.directMessageHandler(dm);
+    }
+
+    // Send ACK back
+    this.sendMessage(socket, {
+      type: 'DIRECT_MESSAGE_ACK',
+      directMessageAck: {
+        type: 'DIRECT_MESSAGE_ACK',
+        messageId: dm.messageId,
+        status: 'delivered',
+      },
+    });
+  }
+
+  /**
+   * Handle direct message ACK
+   */
+  private handleDirectMessageAck(msg: TransferMessage): void {
+    if (!msg.directMessageAck) return;
+    this.emit('message:ack', msg.directMessageAck);
+  }
+
+  /**
+   * Send a direct message to a peer
+   */
+  async sendDirectMessage(
+    targetPubKey: PublicKeyHex,
+    message: DirectMessage
+  ): Promise<DirectMessageAck> {
+    if (!this.swarm) {
+      throw new Error('Transport not initialized');
+    }
+
+    // Create topic from target pubkey
+    const topic = Buffer.from(hexToBytes(targetPubKey));
+
+    return new Promise((resolve, reject) => {
+      // Join the topic as client
+      this.swarm!.join(topic, { client: true, server: false });
+
+      let resolved = false;
+
+      // Listen for ACK
+      const ackHandler = (ack: DirectMessageAck) => {
+        if (ack.messageId === message.messageId) {
+          resolved = true;
+          this.removeListener('message:ack', ackHandler);
+          this.swarm!.off('connection', connectionHandler);
+          resolve(ack);
+        }
+      };
+      this.on('message:ack', ackHandler);
+
+      // Connection handler for sending message when connected
+      const connectionHandler = (socket: any, info: any) => {
+        if (resolved) return;
+        if (!info?.publicKey) return;
+
+        const remotePubKey = bytesToHex(info.publicKey).toLowerCase();
+        if (remotePubKey === targetPubKey.toLowerCase()) {
+          this.sendMessage(socket, {
+            type: 'DIRECT_MESSAGE',
+            directMessage: message,
+          });
+        }
+      };
+
+      this.swarm!.on('connection', connectionHandler);
+
+      // Timeout after 30 seconds
+      setTimeout(() => {
+        if (!resolved) {
+          resolved = true;
+          this.removeListener('message:ack', ackHandler);
+          this.swarm!.off('connection', connectionHandler);
+          reject(new Error('Direct message timeout'));
         }
       }, 30000);
     });

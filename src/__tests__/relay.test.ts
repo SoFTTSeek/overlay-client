@@ -6,7 +6,7 @@
 // Set NODE_ENV before any imports to prevent pino-pretty from loading
 process.env.NODE_ENV = 'production';
 
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 import { writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -16,10 +16,52 @@ import { hashFile } from '../publish/hasher.js';
 // Import the ACTUAL production relay server
 import { RelayServer } from '@softtseek/overlay-relay';
 
+function forceCloseTransport(transport: RelayTransport): void {
+  transport.unregisterProvider();
+  const active = (transport as any).activeConnections as Map<
+    string,
+    { socket?: { destroyed?: boolean; destroy: () => void }; writeStream?: { end: () => void } }
+  >;
+  if (!(active instanceof Map)) return;
+
+  for (const state of active.values()) {
+    try {
+      state.writeStream?.end();
+    } catch {
+      // ignore
+    }
+    try {
+      if (state.socket && !state.socket.destroyed) {
+        state.socket.destroy();
+      }
+    } catch {
+      // ignore
+    }
+  }
+  active.clear();
+}
+
 describe('RelayTransport Integration (Production RelayServer)', () => {
   let relayServer: RelayServer;
   let relayPort: number;
   let testDir: string;
+  let testTransports: RelayTransport[];
+
+  const createRelayTransport = (): RelayTransport => {
+    const transport = new RelayTransport([`127.0.0.1:${relayPort}`]);
+    testTransports.push(transport);
+    return transport;
+  };
+
+  beforeEach(() => {
+    testTransports = [];
+  });
+
+  afterEach(() => {
+    for (const transport of testTransports) {
+      forceCloseTransport(transport);
+    }
+  });
 
   beforeAll(async () => {
     // Create temp directory for test files
@@ -30,18 +72,22 @@ describe('RelayTransport Integration (Production RelayServer)', () => {
     relayPort = 19000 + Math.floor(Math.random() * 1000);
     relayServer = new RelayServer({ port: relayPort, host: '127.0.0.1' });
     await relayServer.start();
-  }, 30000);
+  }, 60000);
 
   afterAll(async () => {
     if (relayServer) {
-      await relayServer.stop();
+      // Some relay sockets can linger briefly; avoid hanging the suite teardown.
+      await Promise.race([
+        relayServer.stop(),
+        new Promise<void>((resolve) => setTimeout(resolve, 5000)),
+      ]);
     }
     try {
       rmSync(testDir, { recursive: true, force: true });
     } catch {
       // Ignore cleanup errors
     }
-  }, 30000);
+  }, 60000);
 
   describe('End-to-End File Transfer', () => {
     it('should transfer a small file (10KB) via relay', async () => {
@@ -55,7 +101,7 @@ describe('RelayTransport Integration (Production RelayServer)', () => {
       const destPath = join(testDir, 'small-file-downloaded.bin');
 
       // Create provider
-      const providerRelay = new RelayTransport([`127.0.0.1:${relayPort}`]);
+      const providerRelay = createRelayTransport();
       const providerPubKey = randomBytes(32).toString('hex');
       const providedFiles = new Map<string, string>();
       providedFiles.set(contentHash, testFilePath);
@@ -68,7 +114,7 @@ describe('RelayTransport Integration (Production RelayServer)', () => {
       expect(connectedProviders).toContain(providerPubKey);
 
       // Create requester and transfer file
-      const requesterRelay = new RelayTransport([`127.0.0.1:${relayPort}`]);
+      const requesterRelay = createRelayTransport();
       const result = await requesterRelay.requestFileFromProvider(
         contentHash,
         providerPubKey,
@@ -94,7 +140,7 @@ describe('RelayTransport Integration (Production RelayServer)', () => {
       const contentHash = await hashFile(testFilePath);
       const destPath = join(testDir, 'large-file-downloaded.bin');
 
-      const providerRelay = new RelayTransport([`127.0.0.1:${relayPort}`]);
+      const providerRelay = createRelayTransport();
       const providerPubKey = randomBytes(32).toString('hex');
       const providedFiles = new Map<string, string>();
       providedFiles.set(contentHash, testFilePath);
@@ -105,7 +151,7 @@ describe('RelayTransport Integration (Production RelayServer)', () => {
       // Verify with actual relay server
       expect(relayServer.getConnectedProviders()).toContain(providerPubKey);
 
-      const requesterRelay = new RelayTransport([`127.0.0.1:${relayPort}`]);
+      const requesterRelay = createRelayTransport();
 
       // Track progress
       const progressEvents: any[] = [];
@@ -136,7 +182,7 @@ describe('RelayTransport Integration (Production RelayServer)', () => {
       const nonExistentPubKey = randomBytes(32).toString('hex');
       const destPath = join(testDir, 'should-not-exist.bin');
 
-      const requesterRelay = new RelayTransport([`127.0.0.1:${relayPort}`]);
+      const requesterRelay = createRelayTransport();
 
       await expect(
         requesterRelay.requestFileFromProvider(contentHash, nonExistentPubKey, destPath)
@@ -146,7 +192,7 @@ describe('RelayTransport Integration (Production RelayServer)', () => {
     }, 10000);
 
     it('should fail gracefully when file is not available on provider', async () => {
-      const providerRelay = new RelayTransport([`127.0.0.1:${relayPort}`]);
+      const providerRelay = createRelayTransport();
       const providerPubKey = randomBytes(32).toString('hex');
       const providedFiles = new Map<string, string>(); // Empty!
 
@@ -156,7 +202,7 @@ describe('RelayTransport Integration (Production RelayServer)', () => {
       // Verify with actual relay server
       expect(relayServer.getConnectedProviders()).toContain(providerPubKey);
 
-      const requesterRelay = new RelayTransport([`127.0.0.1:${relayPort}`]);
+      const requesterRelay = createRelayTransport();
       const contentHash = randomBytes(32).toString('hex');
       const destPath = join(testDir, 'should-not-exist-2.bin');
 
@@ -179,7 +225,7 @@ describe('RelayTransport Integration (Production RelayServer)', () => {
       const contentHash = await hashFile(testFilePath);
       const destPath = join(testDir, 'stability-test-downloaded.bin');
 
-      const providerRelay = new RelayTransport([`127.0.0.1:${relayPort}`]);
+      const providerRelay = createRelayTransport();
       const providerPubKey = randomBytes(32).toString('hex');
       const providedFiles = new Map<string, string>();
       providedFiles.set(contentHash, testFilePath);
@@ -191,7 +237,7 @@ describe('RelayTransport Integration (Production RelayServer)', () => {
       expect(providerRelay.isProviderRegistered()).toBe(true);
       expect(relayServer.getConnectedProviders()).toContain(providerPubKey);
 
-      const requesterRelay = new RelayTransport([`127.0.0.1:${relayPort}`]);
+      const requesterRelay = createRelayTransport();
       const result = await requesterRelay.requestFileFromProvider(
         contentHash,
         providerPubKey,
@@ -224,7 +270,7 @@ describe('RelayTransport Integration (Production RelayServer)', () => {
       writeFileSync(file2Path, file2Content);
       const hash2 = await hashFile(file2Path);
 
-      const providerRelay = new RelayTransport([`127.0.0.1:${relayPort}`]);
+      const providerRelay = createRelayTransport();
       const providerPubKey = randomBytes(32).toString('hex');
       const providedFiles = new Map<string, string>();
       providedFiles.set(hash1, file1Path);
@@ -237,7 +283,7 @@ describe('RelayTransport Integration (Production RelayServer)', () => {
       expect(relayServer.getConnectedProviders()).toContain(providerPubKey);
 
       // First transfer
-      const requester1 = new RelayTransport([`127.0.0.1:${relayPort}`]);
+      const requester1 = createRelayTransport();
       const dest1 = join(testDir, 'multi-1-downloaded.bin');
       const result1 = await requester1.requestFileFromProvider(hash1, providerPubKey, dest1);
       expect(result1).toBe(true);
@@ -248,7 +294,7 @@ describe('RelayTransport Integration (Production RelayServer)', () => {
       expect(relayServer.getConnectedProviders()).toContain(providerPubKey);
 
       // Second transfer
-      const requester2 = new RelayTransport([`127.0.0.1:${relayPort}`]);
+      const requester2 = createRelayTransport();
       const dest2 = join(testDir, 'multi-2-downloaded.bin');
       const result2 = await requester2.requestFileFromProvider(hash2, providerPubKey, dest2);
       expect(result2).toBe(true);
@@ -272,7 +318,7 @@ describe('RelayTransport Integration (Production RelayServer)', () => {
       const contentHash = await hashFile(testFilePath);
       const destPath = join(testDir, 'metrics-test-downloaded.bin');
 
-      const providerRelay = new RelayTransport([`127.0.0.1:${relayPort}`]);
+      const providerRelay = createRelayTransport();
       const providerPubKey = randomBytes(32).toString('hex');
       const providedFiles = new Map<string, string>();
       providedFiles.set(contentHash, testFilePath);
@@ -280,7 +326,7 @@ describe('RelayTransport Integration (Production RelayServer)', () => {
       await providerRelay.registerAsProvider(providerPubKey, providedFiles);
       await new Promise(resolve => setTimeout(resolve, 200));
 
-      const requesterRelay = new RelayTransport([`127.0.0.1:${relayPort}`]);
+      const requesterRelay = createRelayTransport();
       await requesterRelay.requestFileFromProvider(contentHash, providerPubKey, destPath);
 
       // Wait for session cleanup

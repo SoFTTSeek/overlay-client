@@ -15,8 +15,12 @@ import type {
   RelayRole,
   BrowseRequestMessage,
   BrowseResponseMessage,
+  DirectMessage,
+  DirectMessageAck,
 } from '../types.js';
 import { StreamingHasher, verifyFileHash } from '../publish/hasher.js';
+import { IdentityManager } from '../identity/index.js';
+import { getDirectMessageSignableBytes } from '../utils/cbor.js';
 import { createWriteStream, createReadStream } from 'fs';
 import { stat, mkdir, unlink } from 'fs/promises';
 import { dirname } from 'path';
@@ -88,6 +92,11 @@ function parseFrames(buffer: Buffer): { frames: Buffer[]; remaining: Buffer } {
 type BrowseRequestHandler = (msg: BrowseRequestMessage) => BrowseResponseMessage | null;
 
 /**
+ * Direct message handler function type (for relay provider side)
+ */
+type DirectMessageHandler = (msg: DirectMessage) => void;
+
+/**
  * Relay transport client
  */
 export class RelayTransport extends EventEmitter {
@@ -97,6 +106,7 @@ export class RelayTransport extends EventEmitter {
   private providerRegistration: ProviderRegistrationState | null = null;
   private reconnectDelayMs: number = 5000;
   private browseRequestHandler: BrowseRequestHandler | null = null;
+  private directMessageHandler: DirectMessageHandler | null = null;
 
   constructor(relayUrls: string[]) {
     super();
@@ -162,6 +172,9 @@ export class RelayTransport extends EventEmitter {
     if (!selectedRelay) {
       throw new Error('No relay servers available');
     }
+
+    // Pre-create destination directory before connecting (same fix as requestFileFromProvider)
+    await mkdir(dirname(destPath), { recursive: true });
 
     const sessionId = this.generateSessionId();
 
@@ -294,8 +307,7 @@ export class RelayTransport extends EventEmitter {
                 state.totalBytes = msg.size;
                 state.status = 'downloading';
 
-                // Create destination directory
-                await mkdir(dirname(state.destPath!), { recursive: true });
+                // Directory was pre-created in requestFileViaRelay — no async gap
                 state.writeStream = createWriteStream(state.destPath!);
 
                 this.emitProgress(state);
@@ -517,6 +529,12 @@ export class RelayTransport extends EventEmitter {
       if (msg.type === 'BROWSE_REQUEST' && msg.browseRequest && msg.requesterSessionId) {
         console.log('Relay BROWSE_REQUEST received from:', msg.browseRequest.requesterPubKey?.slice(0, 16));
         await this.handleRelayBrowseRequest(socket, msg.browseRequest, msg.requesterSessionId);
+        return;
+      }
+
+      if (msg.type === 'DIRECT_MESSAGE' && msg.directMessage && msg.requesterSessionId) {
+        console.log('Relay DIRECT_MESSAGE received from:', msg.directMessage.from?.slice(0, 16));
+        await this.handleRelayDirectMessage(socket, msg.directMessage, msg.requesterSessionId);
         return;
       }
     } catch (err) {
@@ -749,6 +767,13 @@ export class RelayTransport extends EventEmitter {
       throw new Error('No relay servers available');
     }
 
+    // Pre-create destination directory before connecting.
+    // This MUST happen before data starts flowing — doing it inside the
+    // socket 'data' handler (with await) causes a race condition where
+    // DATA frames arrive while mkdir is pending, before the writeStream
+    // exists, silently dropping file chunks.
+    await mkdir(dirname(destPath), { recursive: true });
+
     // Connect to relay - use persistent=true to disable the 30s socket timeout
     // The transfer has its own 120s timeout, we don't want the socket timeout killing it
     const socket = await this.connectToRelay(selectedRelay, true);
@@ -855,8 +880,8 @@ export class RelayTransport extends EventEmitter {
             const sizeMB = (msg.size / 1024 / 1024).toFixed(1);
             console.log(`Relay: Transfer started - ${sizeMB}MB from ${providerPubKey.slice(0, 8)}`);
 
-            // Create destination directory
-            await mkdir(dirname(state.destPath!), { recursive: true });
+            // Directory was pre-created in requestFileFromProvider — no async
+            // gap that could let DATA frames slip through before writeStream exists
             state.writeStream = createWriteStream(state.destPath!);
 
             this.emitProgress(state);
@@ -900,8 +925,19 @@ export class RelayTransport extends EventEmitter {
             if ((state as any).timeout) clearTimeout((state as any).timeout);
             return;
           }
-        } catch {
-          // Not JSON or parse error - silently ignore as this is likely binary data
+        } catch (err) {
+          // JSON parse errors are expected for non-control frames.
+          // But real errors (e.g. hash verification failure) must propagate.
+          if (err instanceof SyntaxError) {
+            // Not JSON — silently ignore (binary data or non-control frame)
+          } else {
+            // Real processing error — fail the transfer
+            state.status = 'failed';
+            if ((state as any).timeout) clearTimeout((state as any).timeout);
+            this.activeConnections.delete(state.sessionId);
+            state.reject(err instanceof Error ? err : new Error(String(err)));
+            return;
+          }
         }
       }
     });
@@ -950,6 +986,187 @@ export class RelayTransport extends EventEmitter {
    */
   setBrowseRequestHandler(handler: BrowseRequestHandler): void {
     this.browseRequestHandler = handler;
+  }
+
+  /**
+   * Set the direct message handler (for provider role)
+   */
+  setDirectMessageHandler(handler: DirectMessageHandler): void {
+    this.directMessageHandler = handler;
+  }
+
+  /**
+   * Handle a direct message received via relay
+   */
+  private async handleRelayDirectMessage(
+    socket: Socket,
+    directMessage: DirectMessage,
+    requesterSessionId: string
+  ): Promise<void> {
+    console.log('Relay DIRECT_MESSAGE: Handling message from', directMessage.from?.slice(0, 16));
+
+    if (!this.directMessageHandler) {
+      console.log('Relay DIRECT_MESSAGE: No message handler registered');
+      const error = {
+        type: 'DIRECT_MESSAGE_RESPONSE',
+        requesterSessionId,
+        directMessageAck: {
+          type: 'DIRECT_MESSAGE_ACK',
+          messageId: directMessage.messageId,
+          status: 'undeliverable',
+        },
+      };
+      writeFrame(socket, Buffer.from(JSON.stringify(error)));
+      return;
+    }
+
+    // Verify Ed25519 signature before processing
+    try {
+      const signableBytes = getDirectMessageSignableBytes(directMessage);
+      if (!IdentityManager.verify(signableBytes, directMessage.sig, directMessage.from)) {
+        console.error('Relay DIRECT_MESSAGE: Signature verification failed from:', directMessage.from?.slice(0, 16));
+        const rejected = {
+          type: 'DIRECT_MESSAGE_RESPONSE',
+          requesterSessionId,
+          directMessageAck: {
+            type: 'DIRECT_MESSAGE_ACK',
+            messageId: directMessage.messageId,
+            status: 'rejected',
+          },
+        };
+        writeFrame(socket, Buffer.from(JSON.stringify(rejected)));
+        return;
+      }
+    } catch (sigErr: any) {
+      console.error('Relay DIRECT_MESSAGE: Signature check error:', sigErr.message);
+      const rejected = {
+        type: 'DIRECT_MESSAGE_RESPONSE',
+        requesterSessionId,
+        directMessageAck: {
+          type: 'DIRECT_MESSAGE_ACK',
+          messageId: directMessage.messageId,
+          status: 'rejected',
+        },
+      };
+      writeFrame(socket, Buffer.from(JSON.stringify(rejected)));
+      return;
+    }
+
+    try {
+      this.directMessageHandler(directMessage);
+
+      const ackResponse = {
+        type: 'DIRECT_MESSAGE_RESPONSE',
+        requesterSessionId,
+        directMessageAck: {
+          type: 'DIRECT_MESSAGE_ACK',
+          messageId: directMessage.messageId,
+          status: 'delivered',
+        },
+      };
+      writeFrame(socket, Buffer.from(JSON.stringify(ackResponse)));
+      console.log('Relay DIRECT_MESSAGE: Sent ACK for message', directMessage.messageId.slice(0, 16));
+    } catch (err: any) {
+      console.error('Relay DIRECT_MESSAGE: Error:', err.message);
+      const error = {
+        type: 'DIRECT_MESSAGE_RESPONSE',
+        requesterSessionId,
+        directMessageAck: {
+          type: 'DIRECT_MESSAGE_ACK',
+          messageId: directMessage.messageId,
+          status: 'rejected',
+        },
+      };
+      writeFrame(socket, Buffer.from(JSON.stringify(error)));
+    }
+  }
+
+  /**
+   * Send a direct message via relay
+   * Returns a promise that resolves with the ACK
+   */
+  async sendDirectMessage(
+    targetPubKey: PublicKeyHex,
+    relayUrl: string,
+    message: DirectMessage
+  ): Promise<DirectMessageAck> {
+    const selectedRelay = relayUrl || this.relayUrls[0];
+    if (!selectedRelay) {
+      throw new Error('No relay URLs configured');
+    }
+
+    console.log('Sending direct message via relay to:', targetPubKey.slice(0, 16));
+
+    return new Promise(async (resolve, reject) => {
+      try {
+        // Connect to relay
+        const socket = await this.connectToRelay(selectedRelay, true);
+
+        // Set timeout for ACK response
+        const timeout = setTimeout(() => {
+          socket.destroy();
+          reject(new Error('Direct message via relay timed out'));
+        }, 30000);
+
+        let buffer = Buffer.alloc(0);
+
+        socket.on('data', (data: Buffer) => {
+          buffer = Buffer.concat([buffer, data]);
+          const { frames, remaining } = parseFrames(buffer);
+          buffer = Buffer.from(remaining);
+
+          for (const frame of frames) {
+            try {
+              const msg = JSON.parse(frame.toString());
+
+              if (msg.type === 'ERROR') {
+                clearTimeout(timeout);
+                socket.destroy();
+                reject(new Error(msg.error || 'Direct message failed'));
+                return;
+              }
+
+              if (msg.type === 'DIRECT_MESSAGE_RESPONSE' && msg.directMessageAck) {
+                // Verify ACK matches the message we sent
+                if (msg.directMessageAck.messageId !== message.messageId) {
+                  console.log('Relay direct message: Ignoring ACK for wrong messageId:', msg.directMessageAck.messageId?.slice(0, 16));
+                  continue;
+                }
+                clearTimeout(timeout);
+                socket.destroy();
+                console.log('Relay direct message: Received ACK:', msg.directMessageAck.status);
+                resolve(msg.directMessageAck as DirectMessageAck);
+                return;
+              }
+            } catch (err) {
+              console.log('Relay direct message: Frame parse error:', err);
+            }
+          }
+        });
+
+        socket.on('error', (err) => {
+          clearTimeout(timeout);
+          reject(err);
+        });
+
+        socket.on('close', () => {
+          clearTimeout(timeout);
+          reject(new Error('Relay connection closed before receiving ACK'));
+        });
+
+        // Send RELAY_DIRECT_MESSAGE
+        const request = {
+          type: 'RELAY_DIRECT_MESSAGE',
+          providerPubKey: targetPubKey,
+          directMessage: message,
+        };
+        writeFrame(socket, Buffer.from(JSON.stringify(request)));
+        console.log('Relay direct message: Sent RELAY_DIRECT_MESSAGE');
+
+      } catch (err) {
+        reject(err);
+      }
+    });
   }
 
   /**

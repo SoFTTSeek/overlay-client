@@ -3,7 +3,9 @@
  * PRD Section 11.2 - Optional identity layer with profile caching
  */
 
-import type { PublicKeyHex } from '../types.js';
+import type { PublicKeyHex, AuthChallengeResponse } from '../types.js';
+import type { IdentityManager } from '../identity/index.js';
+import { hexToBytes } from '../utils/cbor.js';
 
 /**
  * User profile data
@@ -327,5 +329,95 @@ export class ProfileCache {
   clear(): void {
     this.cache.clear();
     this.handleIndex.clear();
+  }
+
+  private authToken: string | null = null;
+
+  /**
+   * Authenticate with the account service using Ed25519 challenge-response
+   * Returns a session token for authenticated requests
+   */
+  async authenticate(identity: IdentityManager): Promise<string> {
+    if (!this.config.accountServiceUrl) {
+      throw new Error('Account service URL not configured');
+    }
+
+    // Step 1: Request challenge
+    const pubKey = identity.getPublicKey();
+    const challengeRes = await fetch(`${this.config.accountServiceUrl}/v1/auth/challenge`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pubKey }),
+    });
+
+    if (!challengeRes.ok) {
+      throw new Error(`Challenge request failed: ${challengeRes.status}`);
+    }
+
+    const { challenge } = await challengeRes.json() as AuthChallengeResponse;
+
+    // Step 2: Sign challenge with identity
+    const challengeBytes = hexToBytes(challenge);
+    const signature = identity.sign(challengeBytes);
+
+    // Step 3: Verify with server
+    const verifyRes = await fetch(`${this.config.accountServiceUrl}/v1/auth/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pubKey, challenge, signature }),
+    });
+
+    if (!verifyRes.ok) {
+      throw new Error(`Verification failed: ${verifyRes.status}`);
+    }
+
+    const { token } = await verifyRes.json() as { success: boolean; token: string };
+    this.authToken = token;
+    return token;
+  }
+
+  /**
+   * Update agent capabilities on the account service
+   */
+  async updateCapabilities(pubKey: PublicKeyHex, capabilities: string[], identity: IdentityManager): Promise<void> {
+    if (!this.config.accountServiceUrl) {
+      throw new Error('Account service URL not configured');
+    }
+
+    const { encode } = await import('cbor-x');
+    const signable = encode({ pubKey, capabilities });
+    const signature = identity.sign(signable);
+
+    const res = await fetch(`${this.config.accountServiceUrl}/v1/profiles/${pubKey}/capabilities`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ capabilities, signature }),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Update capabilities failed: ${res.status}`);
+    }
+  }
+
+  /**
+   * Find profiles by agent capability
+   */
+  async findByCapability(capability: string): Promise<UserProfile[]> {
+    if (!this.config.accountServiceUrl) {
+      return [];
+    }
+
+    try {
+      const res = await fetch(
+        `${this.config.accountServiceUrl}/v1/profiles/capabilities/${encodeURIComponent(capability)}`
+      );
+
+      if (!res.ok) return [];
+
+      const data = await res.json() as { profiles: UserProfile[] };
+      return data.profiles || [];
+    } catch {
+      return [];
+    }
   }
 }

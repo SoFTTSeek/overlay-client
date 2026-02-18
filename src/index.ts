@@ -62,6 +62,7 @@ export {
   verifyPublishMessage,
   verifyRefreshMessage,
   verifyTombstoneMessage,
+  verifyCollectionSignature,
 } from './publish/publisher.js';
 
 // Transport
@@ -72,13 +73,24 @@ export { RelayTransport } from './transport/relay.js';
 export { ReputationManager, type TransferOutcome } from './reputation/index.js';
 
 // Presence
-export { PresenceBeacon } from './presence/beacon.js';
+export { PresenceBeacon, type ProviderPresence } from './presence/beacon.js';
 
 // Local database
 export { LocalDatabase } from './localdb/index.js';
 
 // Profile cache
-export { ProfileCache } from './profile/cache.js';
+export { ProfileCache, type UserProfile } from './profile/cache.js';
 
 // Browse
 export { BrowseManager } from './browse/manager.js';
+
+// CBOR / signing utilities
+export {
+  encodeCanonical,
+  getDownloadReceiptSignableBytes,
+  getCollectionSignableBytes,
+  getReputationReportSignableBytes,
+  getDirectMessageSignableBytes,
+  hexToBytes,
+  bytesToHex,
+} from './utils/cbor.js';

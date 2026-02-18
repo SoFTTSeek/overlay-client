@@ -4,7 +4,9 @@
  */
 
 import Database from 'better-sqlite3';
-import type { PublicKeyHex, ContentHash } from '../types.js';
+import type { PublicKeyHex, ContentHash, GlobalReputationScore } from '../types.js';
+import type { IdentityManager } from '../identity/index.js';
+import { getReputationReportSignableBytes } from '../utils/cbor.js';
 
 /**
  * Transfer outcome for reputation scoring
@@ -65,6 +67,8 @@ const DEFAULT_CONFIG: ReputationConfig = {
 export class ReputationManager {
   private db: Database.Database;
   private config: ReputationConfig;
+  private authServiceUrl: string | null = null;
+  private globalScoreCache: Map<string, { score: GlobalReputationScore; fetchedAt: number }> = new Map();
 
   // Prepared statements
   private stmts!: {
@@ -78,8 +82,10 @@ export class ReputationManager {
     getAllReputations: Database.Statement;
   };
 
-  constructor(dbPath: string, config: Partial<ReputationConfig> = {}) {
-    this.config = { ...DEFAULT_CONFIG, ...config };
+  constructor(dbPath: string, config: Partial<ReputationConfig> & { authServiceUrl?: string } = {}) {
+    const { authServiceUrl, ...reputationConfig } = config;
+    this.config = { ...DEFAULT_CONFIG, ...reputationConfig };
+    this.authServiceUrl = authServiceUrl ?? null;
     this.db = new Database(dbPath);
     this.initializeSchema();
     this.prepareStatements();
@@ -516,6 +522,95 @@ export class ReputationManager {
       blockedProviders: blocked.length,
       totalTransfers,
     };
+  }
+
+  /**
+   * Set the auth service URL for cloud reputation
+   */
+  setAuthServiceUrl(url: string): void {
+    this.authServiceUrl = url;
+  }
+
+  /**
+   * Submit a reputation report to the cloud auth service (fire-and-forget)
+   */
+  submitReport(
+    identity: IdentityManager,
+    subjectPubKey: PublicKeyHex,
+    outcome: TransferOutcome,
+    bytes: number,
+    durationMs: number
+  ): void {
+    if (!this.authServiceUrl) return;
+
+    const ts = Date.now();
+    const reporterPubKey = identity.getPublicKey();
+
+    const signableBytes = getReputationReportSignableBytes({
+      reporterPubKey,
+      subjectPubKey,
+      outcome,
+      bytes,
+      durationMs,
+      ts,
+    });
+
+    const signature = identity.sign(signableBytes);
+
+    // Fire-and-forget POST
+    fetch(`${this.authServiceUrl}/v1/reputation/report`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        reporterPubKey,
+        subjectPubKey,
+        outcome,
+        bytes,
+        durationMs,
+        ts,
+        signature,
+      }),
+    }).catch(() => {
+      // Silent failure for non-critical async operation
+    });
+  }
+
+  /**
+   * Fetch global reputation score from cloud auth service
+   */
+  async fetchGlobalScore(pubKey: PublicKeyHex): Promise<GlobalReputationScore | null> {
+    if (!this.authServiceUrl) return null;
+
+    // Check cache (5-min TTL)
+    const cached = this.globalScoreCache.get(pubKey);
+    if (cached && Date.now() - cached.fetchedAt < 5 * 60 * 1000) {
+      return cached.score;
+    }
+
+    try {
+      const response = await fetch(`${this.authServiceUrl}/v1/reputation/${pubKey}`);
+      if (!response.ok) return null;
+
+      const score = (await response.json()) as GlobalReputationScore;
+      this.globalScoreCache.set(pubKey, { score, fetchedAt: Date.now() });
+      return score;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Calculate trust score with optional global score blending
+   */
+  getBlendedTrustScore(pubKey: PublicKeyHex, globalScore?: GlobalReputationScore | null): number {
+    const localScore = this.getTrustScore(pubKey);
+
+    if (globalScore && globalScore.totalReports > 0) {
+      // Blend: 70% local, 30% global
+      return 0.7 * localScore + 0.3 * globalScore.globalTrustScore;
+    }
+
+    return localScore;
   }
 
   /**

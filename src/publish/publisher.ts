@@ -4,8 +4,9 @@
  */
 
 import { readdirSync, statSync } from "fs";
-import { readdir, stat } from "fs/promises";
+import { readdir, stat, writeFile, mkdir, unlink } from "fs/promises";
 import { join, basename, dirname, extname } from "path";
+import { homedir } from "os";
 import { parseFile } from "music-metadata";
 
 import type {
@@ -19,17 +20,25 @@ import type {
   TombstoneMessage,
   LocalFileEntry,
   OverlayConfig,
+  Collection,
+  CollectionItem,
 } from "../types.js";
 import { DEFAULT_CONFIG } from "../types.js";
 
 import { IdentityManager } from "../identity/index.js";
 import { LocalDatabase } from "../localdb/index.js";
-import { hashFile } from "./hasher.js";
-import { tokenizeFile, parseExtension, truncateFilename } from "./tokenizer.js";
+import { hashFile, hashBytes } from "./hasher.js";
+import {
+  tokenizeFile,
+  tokenizeFilename,
+  parseExtension,
+  truncateFilename,
+} from "./tokenizer.js";
 import {
   getPublishSignableBytes,
   getRefreshSignableBytes,
   getTombstoneSignableBytes,
+  getCollectionSignableBytes,
 } from "../utils/cbor.js";
 
 /**
@@ -451,6 +460,187 @@ export class Publisher {
 
     return messages;
   }
+
+  /**
+   * Create a signed Collection manifest from local file entries
+   */
+  createCollection(
+    name: string,
+    description: string | undefined,
+    entries: LocalFileEntry[],
+  ): Collection {
+    const providerPubKey = this.identity.getPublicKey();
+    const ts = Date.now();
+    const ttlMs = this.config.defaultTtlMs;
+
+    // Build items from entries
+    const items: CollectionItem[] = entries.map((entry, index) => ({
+      contentHash: entry.contentHash,
+      filename: basename(entry.path),
+      size: entry.size,
+      ext: entry.ext,
+      order: index,
+    }));
+
+    // Build signable bytes (excludes sig and id)
+    const signableBytes = getCollectionSignableBytes({
+      name,
+      description,
+      providerPubKey,
+      items,
+      ts,
+      ttlMs,
+    });
+
+    // Compute content-addressed ID from signable bytes
+    const id = hashBytes(new Uint8Array(signableBytes));
+
+    // Sign
+    const sig = this.identity.sign(signableBytes);
+
+    return {
+      id,
+      name,
+      description,
+      providerPubKey,
+      items,
+      ts,
+      ttlMs,
+      sig,
+    };
+  }
+
+  // ============================================
+  // Buffer Publishing (in-memory data)
+  // ============================================
+
+  /** Maximum total size of all buffer files (100 MB) */
+  private static readonly MAX_BUFFER_DIR_BYTES = 100 * 1024 * 1024;
+
+  /**
+   * Get the directory where buffer files are persisted
+   */
+  private getBufferDir(): string {
+    return join(homedir(), ".softtseek", "buffers");
+  }
+
+  /**
+   * Compute the total size of all files in the buffer directory
+   */
+  private async getBufferDirSize(): Promise<number> {
+    const bufferDir = this.getBufferDir();
+    let total = 0;
+
+    try {
+      const files = await readdir(bufferDir);
+      for (const file of files) {
+        try {
+          const stats = await stat(join(bufferDir, file));
+          total += stats.size;
+        } catch {
+          // Skip files we can't stat
+        }
+      }
+    } catch {
+      // Buffer directory doesn't exist yet
+    }
+
+    return total;
+  }
+
+  /**
+   * Index a buffer (in-memory data) for publishing.
+   * Hashes the data, persists it to disk for serving, tokenizes the name,
+   * and stores the entry in the local DB.
+   */
+  async indexBuffer(
+    name: string,
+    data: Buffer,
+    ext?: FileExtension,
+  ): Promise<LocalFileEntry> {
+    // Hash the buffer first to check if it already exists on disk
+    const contentHash = hashBytes(new Uint8Array(data));
+
+    // Persist to disk for serving
+    const bufferDir = this.getBufferDir();
+    await mkdir(bufferDir, { recursive: true });
+    const bufferPath = join(bufferDir, contentHash);
+
+    // Check existing file size to avoid double-counting in size limit
+    let existingFileSize = 0;
+    try {
+      existingFileSize = (await stat(bufferPath)).size;
+    } catch {
+      // File doesn't exist yet
+    }
+
+    // Enforce total buffer size limit (subtract existing file if re-indexing)
+    const currentSize = await this.getBufferDirSize();
+    const netNewBytes = data.length - existingFileSize;
+    if (netNewBytes > 0 && currentSize + netNewBytes > Publisher.MAX_BUFFER_DIR_BYTES) {
+      throw new Error(
+        `Buffer size limit exceeded: ${currentSize + netNewBytes} bytes would exceed ${Publisher.MAX_BUFFER_DIR_BYTES} byte limit`,
+      );
+    }
+
+    await writeFile(bufferPath, data);
+
+    // Tokenize the name
+    const tokens = tokenizeFilename(name);
+    const fileExt = ext || parseExtension(name);
+
+    const entry: LocalFileEntry = {
+      path: bufferPath,
+      contentHash,
+      size: data.length,
+      mtime: Date.now(),
+      ext: fileExt,
+      tokens,
+    };
+
+    // Store in local DB
+    this.localDb.upsertFile(entry);
+    return entry;
+  }
+
+  /**
+   * Index and publish multiple buffers
+   */
+  async publishBuffers(
+    items: Array<{ name: string; data: Buffer }>,
+  ): Promise<LocalFileEntry[]> {
+    const entries: LocalFileEntry[] = [];
+    for (const item of items) {
+      const entry = await this.indexBuffer(item.name, item.data);
+      entries.push(entry);
+    }
+    return entries;
+  }
+
+  /**
+   * Clean up buffer files whose postings have expired
+   * (i.e., files in the buffer directory that are no longer tracked in the local DB)
+   */
+  async cleanupBuffers(): Promise<number> {
+    const bufferDir = this.getBufferDir();
+    let cleaned = 0;
+
+    try {
+      const files = await readdir(bufferDir);
+      for (const file of files) {
+        // Check if file is still in local DB (still published)
+        const entry = this.localDb.getFileByHash(file);
+        if (!entry) {
+          await unlink(join(bufferDir, file)).catch(() => {});
+          cleaned++;
+        }
+      }
+    } catch {
+      // Buffer directory doesn't exist yet
+    }
+
+    return cleaned;
+  }
 }
 
 /**
@@ -489,4 +679,23 @@ export function verifyTombstoneMessage(msg: TombstoneMessage): boolean {
     removals: msg.removals,
   });
   return IdentityManager.verify(signableBytes, msg.sig, msg.providerPubKey);
+}
+
+/**
+ * Verify a Collection signature
+ */
+export function verifyCollectionSignature(collection: Collection): boolean {
+  const signableBytes = getCollectionSignableBytes({
+    name: collection.name,
+    description: collection.description,
+    providerPubKey: collection.providerPubKey,
+    items: collection.items,
+    ts: collection.ts,
+    ttlMs: collection.ttlMs,
+  });
+  return IdentityManager.verify(
+    signableBytes,
+    collection.sig,
+    collection.providerPubKey,
+  );
 }

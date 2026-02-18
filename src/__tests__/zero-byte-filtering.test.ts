@@ -1,14 +1,12 @@
 /**
  * Tests for zero-byte file filtering during publish and browse
  *
- * Uses real audio files from a test folder to mirror production setup.
- *
  * Bug context: Search was showing 0-byte/trashed files because:
  * 1. Publisher wasn't filtering 0-byte files at scan time
  * 2. Browse manager wasn't filtering 0-byte entries in responses
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, rmSync, writeFileSync, statSync } from 'fs';
+import { mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { IdentityManager } from '../identity/index.js';
@@ -16,20 +14,29 @@ import { LocalDatabase } from '../localdb/index.js';
 import { Publisher } from '../publish/publisher.js';
 import { BrowseManager } from '../browse/manager.js';
 
-// Real production test folder with actual audio files
-const REAL_AUDIO_FOLDER = '/Users/skeetbookpro/Dropbox/- OTHER MUSIC STUFF/2023 DJ Cuts/SoFTTSeek';
+function seedFixtureFiles(baseDir: string): void {
+  writeFileSync(join(baseDir, 'Valid Song.mp3'), 'v'.repeat(2048));
+  writeFileSync(join(baseDir, 'Second Valid.aiff'), 'a'.repeat(4096));
+  writeFileSync(join(baseDir, 'Tiny Song.mp3'), 'tiny');
+  writeFileSync(join(baseDir, 'Zero Song.mp3'), '');
+  writeFileSync(join(baseDir, '.DS_Store'), 'dotfile');
+}
 
-describe('Zero-byte file filtering (production data)', () => {
+describe('Zero-byte file filtering', () => {
   let testDir: string;
   let dbPath: string;
   let identityDir: string;
+  let fixtureDir: string;
 
   beforeEach(() => {
     testDir = join(tmpdir(), `overlay-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     mkdirSync(testDir, { recursive: true });
     dbPath = join(testDir, 'localfiles.db');
     identityDir = join(testDir, 'identity');
+    fixtureDir = join(testDir, 'fixtures');
     mkdirSync(identityDir, { recursive: true });
+    mkdirSync(fixtureDir, { recursive: true });
+    seedFixtureFiles(fixtureDir);
   });
 
   afterEach(() => {
@@ -40,17 +47,17 @@ describe('Zero-byte file filtering (production data)', () => {
     }
   });
 
-  describe('Publisher.scanDirectory with real audio folder', () => {
-    it('should find real audio files and skip dotfiles like .DS_Store', async () => {
+  describe('Publisher.scanDirectory', () => {
+    it('should find valid audio files and skip dotfiles/zero-byte/tiny audio files', async () => {
       const identity = new IdentityManager(identityDir);
       await identity.initialize();
 
       const localDb = new LocalDatabase(dbPath);
       const publisher = new Publisher(identity, localDb);
 
-      const scanResults = await publisher.scanDirectory(REAL_AUDIO_FOLDER);
+      const scanResults = await publisher.scanDirectory(fixtureDir);
 
-      // Should find audio files
+      // Should find some files
       expect(scanResults.length).toBeGreaterThan(0);
 
       // Should NOT include any dotfiles
@@ -68,7 +75,7 @@ describe('Zero-byte file filtering (production data)', () => {
       );
       expect(tinyAudioFiles).toEqual([]);
 
-      // Verify we found some mp3/flac files
+      // Verify we found valid audio files
       const audioFiles = scanResults.filter(r =>
         audioExtensions.includes(r.ext)
       );
@@ -83,8 +90,8 @@ describe('Zero-byte file filtering (production data)', () => {
       const publisher = new Publisher(identity, localDb);
       const browseManager = new BrowseManager(identity, localDb);
 
-      // Scan and index real files
-      const scanResults = await publisher.scanDirectory(REAL_AUDIO_FOLDER);
+      // Scan and index fixture files
+      const scanResults = await publisher.scanDirectory(fixtureDir);
       expect(scanResults.length).toBeGreaterThan(0);
 
       await publisher.indexFiles(scanResults);
@@ -114,8 +121,8 @@ describe('Zero-byte file filtering (production data)', () => {
       const publisher = new Publisher(identity, localDb);
       const browseManager = new BrowseManager(identity, localDb);
 
-      // Index some real files first
-      const scanResults = await publisher.scanDirectory(REAL_AUDIO_FOLDER);
+      // Index fixture files first
+      const scanResults = await publisher.scanDirectory(fixtureDir);
       const subset = scanResults.slice(0, 5); // Just index a few for speed
       await publisher.indexFiles(subset);
 

@@ -14,11 +14,12 @@
  * - Worst case: 3 attempts × 30s = 90s per transfer method
  * - Tests need sufficient timeout to complete full retry cycle
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdirSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { SoulseekBridge, UnifiedSearchResult } from '../bridge/soulseek.js';
+import { DirectTransport } from '../transport/direct.js';
 import { IdentityManager } from '../identity/index.js';
 import { LocalDatabase } from '../localdb/index.js';
 
@@ -39,6 +40,7 @@ describe('Transfer ID consistency', () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     try {
       rmSync(testDir, { recursive: true, force: true });
     } catch {
@@ -48,6 +50,10 @@ describe('Transfer ID consistency', () => {
 
   describe('SoulseekBridge transfer ID handling', () => {
     it('should use contentHash as transfer ID and complete download attempt', async () => {
+      vi.spyOn(DirectTransport.prototype, 'requestFile').mockRejectedValue(
+        new Error('timeout')
+      );
+
       const identity = new IdentityManager(identityDir);
       await identity.initialize();
       const localDb = new LocalDatabase(dbPath);
@@ -57,6 +63,8 @@ describe('Transfer ID consistency', () => {
         relayUrls: [],
         soulseekFallbackEnabled: false,
         maxRetries: 1, // Single retry for faster test
+        directTimeoutMs: 200,
+        relayTimeoutMs: 200,
       });
 
       await bridge.initialize({
@@ -112,6 +120,10 @@ describe('Transfer ID consistency', () => {
     }, REALISTIC_TEST_TIMEOUT);
 
     it('should cleanup transfers using the correct ID after failed download', async () => {
+      vi.spyOn(DirectTransport.prototype, 'requestFile').mockRejectedValue(
+        new Error('timeout')
+      );
+
       const identity = new IdentityManager(identityDir);
       await identity.initialize();
       const localDb = new LocalDatabase(dbPath);
@@ -121,6 +133,8 @@ describe('Transfer ID consistency', () => {
         relayUrls: [],
         soulseekFallbackEnabled: false,
         maxRetries: 1,
+        directTimeoutMs: 200,
+        relayTimeoutMs: 200,
       });
 
       await bridge.initialize({

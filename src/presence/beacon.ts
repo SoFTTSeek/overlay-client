@@ -18,6 +18,8 @@ interface BeaconMessage {
   contentHashes?: ContentHash[];
   timestamp: number;
   capabilities?: string[];
+  /** Agent-level capabilities (separate from transport capabilities) */
+  agentCapabilities?: string[];
 }
 
 /**
@@ -29,6 +31,8 @@ export interface ProviderPresence {
   lastSeen: number;
   connectionQuality: 'unknown' | 'direct' | 'relay' | 'offline';
   capabilities: string[];
+  /** Agent-level capabilities (e.g., 'audio-transcription', 'seeding') */
+  agentCapabilities: string[];
 }
 
 /**
@@ -62,6 +66,7 @@ export class PresenceBeacon extends EventEmitter {
   private config: BeaconConfig;
   private myPubKey: PublicKeyHex;
   private myContentHashes: Set<ContentHash> = new Set();
+  private myAgentCapabilities: string[] = [];
   private knownProviders: Map<PublicKeyHex, ProviderPresence> = new Map();
   private contentProviders: Map<ContentHash, Set<PublicKeyHex>> = new Map();
   private announceInterval: NodeJS.Timeout | null = null;
@@ -113,6 +118,30 @@ export class PresenceBeacon extends EventEmitter {
       await this.swarm.destroy();
       this.swarm = null;
     }
+  }
+
+  /**
+   * Set agent-level capabilities (separate from transport capabilities)
+   * These are broadcast in presence messages for capability-based discovery
+   */
+  setAgentCapabilities(capabilities: string[]): void {
+    this.myAgentCapabilities = capabilities;
+  }
+
+  /**
+   * Get our agent capabilities
+   */
+  getAgentCapabilities(): string[] {
+    return [...this.myAgentCapabilities];
+  }
+
+  /**
+   * Find providers advertising a specific agent capability
+   */
+  findByAgentCapability(capability: string): ProviderPresence[] {
+    return this.getAllProviders().filter(p =>
+      p.agentCapabilities.includes(capability)
+    );
   }
 
   /**
@@ -264,12 +293,15 @@ export class PresenceBeacon extends EventEmitter {
         lastSeen: Date.now(),
         connectionQuality: 'direct',
         capabilities: msg.capabilities || [],
+        agentCapabilities: msg.agentCapabilities || [],
       };
       this.knownProviders.set(msg.pubKey, presence);
     }
 
     presence.lastSeen = Date.now();
     presence.connectionQuality = 'direct';
+    presence.capabilities = msg.capabilities || presence.capabilities;
+    presence.agentCapabilities = msg.agentCapabilities || presence.agentCapabilities;
 
     if (msg.contentHashes) {
       for (const hash of msg.contentHashes) {
@@ -312,6 +344,7 @@ export class PresenceBeacon extends EventEmitter {
       contentHashes: Array.from(this.myContentHashes),
       timestamp: Date.now(),
       capabilities: ['direct', 'relay'],
+      agentCapabilities: this.myAgentCapabilities.length > 0 ? this.myAgentCapabilities : undefined,
     };
 
     try {
@@ -333,6 +366,7 @@ export class PresenceBeacon extends EventEmitter {
       contentHashes: Array.from(this.myContentHashes),
       timestamp: Date.now(),
       capabilities: ['direct', 'relay'],
+      agentCapabilities: this.myAgentCapabilities.length > 0 ? this.myAgentCapabilities : undefined,
     };
 
     const data = JSON.stringify(msg) + '\n';

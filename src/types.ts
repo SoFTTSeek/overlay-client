@@ -118,7 +118,10 @@ export type MessageType =
   | 'PROFILE_REQUEST'
   | 'PROFILE_RESPONSE'
   | 'BROWSE_REQUEST'
-  | 'BROWSE_RESPONSE';
+  | 'BROWSE_RESPONSE'
+  | 'DIRECT_MESSAGE'
+  | 'DIRECT_MESSAGE_ACK'
+  | 'COLLECTION_PUBLISH';
 
 /**
  * PUBLISH message - announce files to indexers
@@ -245,8 +248,31 @@ export interface Profile {
   displayName?: string;
   handle?: Handle;
   capabilities: ProviderCapabilities;
+  /** Agent-level capabilities (separate from transport capabilities) */
+  agentCapabilities?: string[];
   ts: number;
   sig: SignatureHex;
+}
+
+// ============================================
+// Auth Types (Ed25519 Challenge-Response)
+// ============================================
+
+/**
+ * Response from POST /v1/auth/challenge
+ */
+export interface AuthChallengeResponse {
+  challenge: string;
+  expiresAt: number;
+}
+
+/**
+ * Request for POST /v1/auth/verify
+ */
+export interface AuthVerifyRequest {
+  pubKey: PublicKeyHex;
+  challenge: string;
+  signature: SignatureHex;
 }
 
 export interface ProfileRequestMessage {
@@ -538,6 +564,120 @@ export interface BrowseResponseMessage {
 }
 
 // ============================================
+// Direct Messaging Types
+// ============================================
+
+/**
+ * DIRECT_MESSAGE - signed addressed message between peers
+ */
+export interface DirectMessage {
+  type: 'DIRECT_MESSAGE';
+  messageId: ContentHash;
+  from: PublicKeyHex;
+  to: PublicKeyHex;
+  ts: number;
+  contentType: string;
+  payload: string;
+  sig: SignatureHex;
+}
+
+/**
+ * DIRECT_MESSAGE_ACK - acknowledgment of message receipt
+ */
+export interface DirectMessageAck {
+  type: 'DIRECT_MESSAGE_ACK';
+  messageId: ContentHash;
+  status: 'delivered' | 'rejected' | 'undeliverable';
+}
+
+// ============================================
+// Reputation Types (Cloud)
+// ============================================
+
+export interface ReputationReport {
+  reporterPubKey: PublicKeyHex;
+  subjectPubKey: PublicKeyHex;
+  outcome: 'success' | 'timeout' | 'corrupt' | 'refused';
+  bytes: number;
+  durationMs: number;
+  ts: number;
+  sig: SignatureHex;
+}
+
+export interface GlobalReputationScore {
+  pubKey: PublicKeyHex;
+  globalTrustScore: number;
+  totalReports: number;
+  successfulReports: number;
+  totalBytes: number;
+  reporterCount: number;
+}
+
+// ============================================
+// Collection Types
+// ============================================
+
+export interface CollectionItem {
+  contentHash: ContentHash;
+  filename: string;
+  size: number;
+  ext: FileExtension;
+  order: number;
+}
+
+export interface Collection {
+  id: ContentHash;
+  name: string;
+  description?: string;
+  providerPubKey: PublicKeyHex;
+  items: CollectionItem[];
+  ts: number;
+  ttlMs: number;
+  sig: SignatureHex;
+}
+
+export interface CollectionPublishMessage {
+  type: 'COLLECTION_PUBLISH';
+  collection: Collection;
+}
+
+// ============================================
+// Subscription Types
+// ============================================
+
+export interface SearchSubscription {
+  id: string;
+  pubKey: PublicKeyHex;
+  tokens: string[];
+  filters?: QueryFilters;
+  callbackUrl?: string;
+  createdAt: number;
+  expiresAt: number;
+}
+
+export interface SubscriptionNotification {
+  subscriptionId: string;
+  matchedTokens: string[];
+  posting: {
+    contentHash: ContentHash;
+    providerPubKey: PublicKeyHex;
+    size: number;
+    ext: FileExtension;
+    filenameShort?: string;
+    ts: number;
+  };
+}
+
+export interface DownloadReceipt {
+  contentHash: ContentHash;
+  downloaderPubKey: PublicKeyHex;
+  providerPubKey: PublicKeyHex;
+  ts: number;
+  bytesReceived: number;
+  sig: SignatureHex;
+}
+
+// ============================================
 // Union Types for Message Handling
 // ============================================
 
@@ -545,7 +685,8 @@ export type IndexerMessage =
   | PublishMessage
   | RefreshMessage
   | TombstoneMessage
-  | QueryMessage;
+  | QueryMessage
+  | CollectionPublishMessage;
 
 export type IndexerResponse = QueryResponseMessage;
 
@@ -555,6 +696,8 @@ export type PeerMessage =
   | ProfileResponseMessage
   | RelayHelloMessage
   | BrowseRequestMessage
-  | BrowseResponseMessage;
+  | BrowseResponseMessage
+  | DirectMessage
+  | DirectMessageAck;
 
 export type AnyMessage = IndexerMessage | IndexerResponse | PeerMessage;

@@ -13,6 +13,8 @@ import type {
   TransferStatus,
   OverlayBrowseFile,
   BrowseResponseMessage,
+  DirectMessage,
+  DirectMessageAck,
 } from '../types.js';
 import { QueryRouter } from '../search/query.js';
 import { DirectTransport } from '../transport/direct.js';
@@ -22,6 +24,10 @@ import { PresenceBeacon } from '../presence/beacon.js';
 import { BrowseManager } from '../browse/manager.js';
 import { LocalDatabase } from '../localdb/index.js';
 import { IdentityManager, computeFingerprint } from '../identity/index.js';
+import { Publisher } from '../publish/publisher.js';
+import { ProfileCache, type UserProfile } from '../profile/cache.js';
+import { getDirectMessageSignableBytes } from '../utils/cbor.js';
+import { hashBytes } from '../publish/hasher.js';
 
 /**
  * Transfer ladder step
@@ -142,6 +148,10 @@ export class SoulseekBridge extends EventEmitter {
   private reputation: ReputationManager | null = null;
   private beacon: PresenceBeacon | null = null;
   private browseManager: BrowseManager | null = null;
+  private publisher: Publisher | null = null;
+  private identity: IdentityManager | null = null;
+  private profileCache: ProfileCache | null = null;
+  private directMessageHandler: ((msg: DirectMessage) => void) | null = null;
   private activeTransfers: Map<string, TransferState> = new Map();
   private lastProgressEmit: Map<string, { time: number; status: TransferStatus }> = new Map();
   private readonly progressEmitIntervalMs = 200;
@@ -167,7 +177,24 @@ export class SoulseekBridge extends EventEmitter {
     soulseekCallbacks?: SoulseekBridgeCallbacks;
     identity?: IdentityManager;
     localDb?: LocalDatabase;
+    publisher?: Publisher;
+    profileCache?: ProfileCache;
   }): Promise<void> {
+    // Store publisher if provided
+    if (options.publisher) {
+      this.publisher = options.publisher;
+    }
+
+    // Store identity for message signing
+    if (options.identity) {
+      this.identity = options.identity;
+    }
+
+    // Store profile cache for capability discovery
+    if (options.profileCache) {
+      this.profileCache = options.profileCache;
+    }
+
     // Initialize overlay components
     this.queryRouter = new QueryRouter(options.indexerUrls);
     this.directTransport = new DirectTransport(options.myPubKey);
@@ -194,6 +221,19 @@ export class SoulseekBridge extends EventEmitter {
         this.handleBrowseResponse(response);
       });
     }
+
+    // Wire up direct message handlers on both transports
+    this.directTransport.setDirectMessageHandler((msg: DirectMessage) => {
+      if (this.directMessageHandler) {
+        this.directMessageHandler(msg);
+      }
+    });
+
+    this.relayTransport.setDirectMessageHandler((msg: DirectMessage) => {
+      if (this.directMessageHandler) {
+        this.directMessageHandler(msg);
+      }
+    });
 
     // Initialize transports
     await this.directTransport.initialize();
@@ -593,6 +633,10 @@ export class SoulseekBridge extends EventEmitter {
             state.totalBytes,
             duration
           );
+          // Submit cloud reputation report (fire-and-forget)
+          if (this.identity) {
+            this.reputation.submitReport(this.identity, provider.pubKey, 'success', state.totalBytes, duration);
+          }
         }
 
         return success;
@@ -600,13 +644,18 @@ export class SoulseekBridge extends EventEmitter {
         state.lastError = err.message;
 
         if (this.reputation) {
+          const directOutcome: TransferOutcome = err.message.includes('timeout') ? 'timeout' : 'refused';
           this.reputation.recordTransfer(
             provider.pubKey,
             state.result.contentHash!,
-            err.message.includes('timeout') ? 'timeout' : 'refused',
+            directOutcome,
             0,
             0
           );
+          // Submit cloud reputation report (fire-and-forget)
+          if (this.identity) {
+            this.reputation.submitReport(this.identity, provider.pubKey, directOutcome, 0, 0);
+          }
         }
       }
     }
@@ -674,6 +723,10 @@ export class SoulseekBridge extends EventEmitter {
             state.totalBytes,
             duration
           );
+          // Submit cloud reputation report (fire-and-forget)
+          if (this.identity) {
+            this.reputation.submitReport(this.identity, provider.pubKey, 'success', state.totalBytes, duration);
+          }
         }
 
         return success;
@@ -682,13 +735,18 @@ export class SoulseekBridge extends EventEmitter {
         state.lastError = err.message;
 
         if (this.reputation) {
+          const relayOutcome: TransferOutcome = err.message.includes('timeout') ? 'timeout' : 'refused';
           this.reputation.recordTransfer(
             provider.pubKey,
             state.result.contentHash!,
-            err.message.includes('timeout') ? 'timeout' : 'refused',
+            relayOutcome,
             0,
             0
           );
+          // Submit cloud reputation report (fire-and-forget)
+          if (this.identity) {
+            this.reputation.submitReport(this.identity, provider.pubKey, relayOutcome, 0, 0);
+          }
         }
       }
     }
@@ -968,6 +1026,20 @@ export class SoulseekBridge extends EventEmitter {
   }
 
   /**
+   * Publish a buffer (in-memory data) to the overlay network.
+   * Indexes the buffer via the Publisher, registers the file for serving,
+   * and lets the normal publish cycle propagate it to indexers.
+   */
+  async publishBuffer(name: string, data: Buffer): Promise<void> {
+    if (!this.publisher) {
+      throw new Error("Publisher not available");
+    }
+    const entry = await this.publisher.indexBuffer(name, data);
+    // Register file for serving via direct P2P
+    this.registerProvidedFile(entry.contentHash, entry.path);
+  }
+
+  /**
    * Browse an overlay provider's files
    * Tries direct P2P and relay in parallel - first success wins
    */
@@ -1121,6 +1193,168 @@ export class SoulseekBridge extends EventEmitter {
   }
 
   /**
+   * Send a direct message to a peer
+   * Builds, signs, and sends a DirectMessage via direct P2P or relay fallback
+   */
+  async sendMessage(
+    targetPubKey: PublicKeyHex,
+    content: string,
+    contentType = 'text/plain'
+  ): Promise<DirectMessageAck> {
+    if (!this.initialized || !this.identity) {
+      throw new Error('Bridge not initialized or identity not available');
+    }
+
+    const myPubKey = this.identity.getPublicKey();
+    const ts = Date.now();
+
+    // Build the signable data
+    const signableBytes = getDirectMessageSignableBytes({
+      from: myPubKey,
+      to: targetPubKey,
+      ts,
+      contentType,
+      payload: content,
+    });
+
+    // Compute messageId as BLAKE3 hash of the signable bytes
+    const messageId = hashBytes(signableBytes);
+
+    // Sign the message
+    const sig = this.identity.sign(signableBytes);
+
+    const message: DirectMessage = {
+      type: 'DIRECT_MESSAGE',
+      messageId,
+      from: myPubKey,
+      to: targetPubKey,
+      ts,
+      contentType,
+      payload: content,
+      sig,
+    };
+
+    // Try direct transport first, fall back to relay (same ladder pattern as browse)
+    if (this.directTransport) {
+      try {
+        const ack = await this.directTransport.sendDirectMessage(targetPubKey, message);
+        return ack;
+      } catch (err) {
+        console.log('Direct message via P2P failed, trying relay:', (err as Error).message);
+      }
+    }
+
+    // Fall back to relay
+    if (this.relayTransport && this.config.relayUrls.length > 0) {
+      const ack = await this.relayTransport.sendDirectMessage(
+        targetPubKey,
+        this.config.relayUrls[0],
+        message
+      );
+      return ack;
+    }
+
+    throw new Error('No transport available for direct messaging');
+  }
+
+  /**
+   * Register a handler for incoming direct messages
+   */
+  onMessage(handler: (msg: DirectMessage) => void): void {
+    this.directMessageHandler = handler;
+  }
+
+  /**
+   * Set agent capabilities and broadcast via presence beacon + auth service
+   */
+  async setCapabilities(capabilities: string[]): Promise<void> {
+    // Update beacon for DHT-based discovery
+    if (this.beacon) {
+      this.beacon.setAgentCapabilities(capabilities);
+    }
+
+    // Update auth service profile for cloud-based discovery
+    if (this.profileCache && this.identity) {
+      try {
+        const pubKey = this.identity.getPublicKey();
+        await this.profileCache.updateCapabilities(pubKey, capabilities, this.identity);
+      } catch (err) {
+        console.error('Failed to update capabilities on auth service:', err);
+      }
+    }
+  }
+
+  /**
+   * Find peers advertising a specific agent capability
+   * Queries both DHT presence (local) and auth service (cloud)
+   */
+  async findPeersByCapability(capability: string): Promise<UserProfile[]> {
+    const profiles: UserProfile[] = [];
+    const seen = new Set<string>();
+
+    // Query auth service for cloud-based discovery
+    if (this.profileCache) {
+      try {
+        const cloudProfiles = await this.profileCache.findByCapability(capability);
+        for (const p of cloudProfiles) {
+          if (!seen.has(p.pubKey)) {
+            seen.add(p.pubKey);
+            profiles.push(p);
+          }
+        }
+      } catch (err) {
+        console.error('Failed to query capabilities from auth service:', err);
+      }
+    }
+
+    // Also check DHT presence for peers not registered with auth service
+    if (this.beacon) {
+      const dhtPeers = this.beacon.findByAgentCapability(capability);
+      for (const peer of dhtPeers) {
+        if (!seen.has(peer.pubKey)) {
+          seen.add(peer.pubKey);
+          profiles.push({
+            pubKey: peer.pubKey,
+            createdAt: 0,
+            updatedAt: peer.lastSeen,
+          });
+        }
+      }
+    }
+
+    return profiles;
+  }
+
+  /**
+   * Get agent capabilities for a specific peer
+   * Checks cache first, then fetches from auth service
+   */
+  async getCapabilities(pubKey: PublicKeyHex): Promise<string[]> {
+    // Check DHT presence first (fastest, no network)
+    if (this.beacon) {
+      const providers = this.beacon.getAllProviders();
+      const provider = providers.find(p => p.pubKey === pubKey);
+      if (provider && provider.agentCapabilities.length > 0) {
+        return provider.agentCapabilities;
+      }
+    }
+
+    // Fall back to auth service profile
+    if (this.profileCache) {
+      const profile = await this.profileCache.getProfile(pubKey);
+      // UserProfile doesn't have agentCapabilities, but the auth service
+      // returns them on the Profile type. Re-fetch if needed.
+      if (profile) {
+        // The profile cache fetches from auth service which includes agentCapabilities
+        // in the response. We can access it if it's been extended.
+        return (profile as any).agentCapabilities || [];
+      }
+    }
+
+    return [];
+  }
+
+  /**
    * Handle incoming browse response
    */
   private handleBrowseResponse(response: BrowseResponseMessage): void {
@@ -1135,8 +1369,7 @@ export class SoulseekBridge extends EventEmitter {
           files: response.files,
         }));
 
-        // Use static verify method from IdentityManager
-        const { IdentityManager } = require('../identity/index.js');
+        // Verify browse response signature
         if (!IdentityManager.verify(signableData, response.sig, response.providerPubKey)) {
           pending.reject(new Error('Invalid browse response signature'));
           clearTimeout(pending.timeout);
