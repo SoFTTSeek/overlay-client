@@ -175,7 +175,7 @@ export class FileIdentityStorage implements IdentityStorage {
   }
 
   async save(identity: Identity): Promise<void> {
-    await writeFile(this.filePath, JSON.stringify(identity));
+    await writeFile(this.filePath, JSON.stringify(identity), { mode: 0o600 });
   }
 
   async load(): Promise<Identity | null> {

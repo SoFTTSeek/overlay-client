@@ -23,7 +23,7 @@ import { IndexerSelector, getShardForToken, groupTokensByShard } from './shardin
  * Indexer client interface
  */
 export interface IndexerClient {
-  query(indexerUrl: string, msg: QueryMessage): Promise<QueryResponseMessage>;
+  query(indexerUrl: string, msg: QueryMessage, signal?: AbortSignal): Promise<QueryResponseMessage>;
 }
 
 /**
@@ -36,16 +36,21 @@ export class HttpIndexerClient implements IndexerClient {
     this.timeout = timeoutMs;
   }
 
-  async query(indexerUrl: string, msg: QueryMessage): Promise<QueryResponseMessage> {
+  async query(indexerUrl: string, msg: QueryMessage, signal?: AbortSignal): Promise<QueryResponseMessage> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+
+    // Combine internal timeout signal with external signal if provided
+    const combinedSignal = signal
+      ? AbortSignal.any([controller.signal, signal])
+      : controller.signal;
 
     try {
       const response = await fetch(`${indexerUrl}/v1/query`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(msg),
-        signal: controller.signal,
+        signal: combinedSignal,
       });
 
       if (!response.ok) {
@@ -97,7 +102,9 @@ export class QueryRouter {
   async search(
     queryString: string,
     filters?: QueryFilters,
-    limit: number = 200
+    limit: number = 200,
+    signal?: AbortSignal,
+    timeoutMs?: number,
   ): Promise<SearchResult[]> {
     // Tokenize query
     const tokens = tokenizeQuery(queryString);
@@ -105,6 +112,11 @@ export class QueryRouter {
     if (tokens.length === 0) {
       return [];
     }
+
+    // Build a combined signal from caller signal + per-query timeout
+    const querySignal = timeoutMs
+      ? (signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs))
+      : signal;
 
     // Use rare-first strategy: query rarest token first for early filtering
     const rarestToken = getRarestToken(tokens);
@@ -127,7 +139,7 @@ export class QueryRouter {
       };
 
       const promise = this.client
-        .query(indexerUrl, msg)
+        .query(indexerUrl, msg, querySignal)
         .then(response => ({
           indexerUrl,
           tokens: indexerTokenList,

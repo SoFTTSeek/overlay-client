@@ -5,32 +5,59 @@
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./lite": {
+      "types": "./dist/lite.d.ts",
+      "default": "./dist/lite.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
     "test": "vitest",
-    "lint": "eslint src"
+    "lint": "eslint src",
+    "prepublishOnly": "npm run build && bash ../../scripts/pre-publish-guard.sh"
   },
   "dependencies": {
     "@noble/ed25519": "^2.1.0",
     "@noble/hashes": "^1.4.0",
     "@scure/bip39": "^2.0.1",
+    "blake3-wasm": "^2.0.0",
+    "cbor-x": "^1.5.9",
+    "music-metadata": "^10.0.0"
+  },
+  "optionalDependencies": {
     "better-sqlite3": "^11.3.0",
     "blake3": "^2.1.7",
-    "cbor-x": "^1.5.9",
     "hyperbee": "^2.19.5",
     "hypercore": "^10.37.12",
     "hyperdht": "^6.15.4",
     "hyperswarm": "^4.7.15",
-    "music-metadata": "^10.0.0",
     "sodium-native": "^4.1.1"
   },
   "devDependencies": {
-    "@softtseek/overlay-relay": "file:../relay",
     "@types/better-sqlite3": "^7.6.11",
     "@types/node": "^22.0.0",
     "eslint": "^9.0.0",
     "typescript": "^5.5.0",
     "vitest": "^2.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/softtseek/overlay-client"
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
   }
 }

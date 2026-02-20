@@ -907,7 +907,8 @@ export class RelayTransport extends EventEmitter {
     contentHash: ContentHash,
     providerPubKey: string,
     destPath: string,
-    relayUrl?: string
+    relayUrl?: string,
+    opts?: { signal?: AbortSignal; timeoutMs?: number },
   ): Promise<boolean> {
     const relayCandidates = this.getRelayCandidates(relayUrl);
     if (relayCandidates.length === 0) {
@@ -921,17 +922,28 @@ export class RelayTransport extends EventEmitter {
     // exists, silently dropping file chunks.
     await mkdir(dirname(destPath), { recursive: true });
 
+    const deadline = opts?.timeoutMs ? Date.now() + opts.timeoutMs : undefined;
+
     const errors: string[] = [];
     for (const candidate of relayCandidates) {
+      if (opts?.signal?.aborted) {
+        throw new Error('Download aborted');
+      }
+      const remainingMs = deadline ? deadline - Date.now() : undefined;
+      if (remainingMs !== undefined && remainingMs <= 0) {
+        throw new Error('Relay transfer timeout');
+      }
       try {
         return await this.requestFileFromProviderViaRelay(
           contentHash,
           providerPubKey,
           destPath,
           candidate,
+          { signal: opts?.signal, timeoutMs: remainingMs },
         );
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
+        if (opts?.signal?.aborted) throw err;
         errors.push(`${candidate}: ${message}`);
         // Ensure retries always start clean, even if the previous attempt left a partial file.
         await unlink(destPath).catch(() => {});
@@ -946,9 +958,10 @@ export class RelayTransport extends EventEmitter {
     providerPubKey: string,
     destPath: string,
     relayUrl: string,
+    opts?: { signal?: AbortSignal; timeoutMs?: number },
   ): Promise<boolean> {
     // Connect to relay - use persistent=true to disable the 30s socket timeout
-    // The transfer has its own 120s timeout, we don't want the socket timeout killing it
+    // The transfer has its own timeout, we don't want the socket timeout killing it
     const socket = await this.connectToRelay(relayUrl, true);
 
     return new Promise((resolve, reject) => {
@@ -979,32 +992,55 @@ export class RelayTransport extends EventEmitter {
       // Set up handlers for receiving file
       this.setupRequesterSocketHandlers(socket, state);
 
-      // Set timeout with proper cleanup
-      const timeout = setTimeout(async () => {
+      // Shared cleanup for abort/timeout
+      const abortTransfer = async (reason: string) => {
         if (state.status === 'connecting' || state.status === 'downloading') {
           state.status = 'failed';
           this.activeConnections.delete(state.sessionId);
-
-          // Close the socket to prevent further data handling
-          if (!socket.destroyed) {
-            socket.destroy();
-          }
-
-          // Close write stream if open
-          if (state.writeStream) {
-            state.writeStream.end();
-          }
-
-          // Clean up partial file
-          if (state.destPath) {
-            await unlink(state.destPath).catch(() => {});
-          }
-
-          reject(new Error('Relay transfer timeout'));
+          if (!socket.destroyed) socket.destroy();
+          if (state.writeStream) state.writeStream.end();
+          if (state.destPath) await unlink(state.destPath).catch(() => {});
+          reject(new Error(reason));
         }
-      }, 120000); // 2 minute timeout for relay transfers
+      };
 
-      // Store timeout and socket so we can clear them on success
+      const transferTimeout = opts?.timeoutMs ?? 120000;
+      const timeout = setTimeout(
+        () => abortTransfer('Relay transfer timeout'),
+        transferTimeout,
+      );
+
+      // Wire external abort signal (named fn for cleanup)
+      const onAbort = () => {
+        clearTimeout(timeout);
+        abortTransfer('Download aborted');
+      };
+      if (opts?.signal) {
+        if (opts.signal.aborted) {
+          clearTimeout(timeout);
+          abortTransfer('Download aborted');
+          return;
+        }
+        opts.signal.addEventListener('abort', onAbort, { once: true });
+      }
+
+      // Patch resolve/reject so abort listener is removed on ANY exit path.
+      // setupRequesterSocketHandlers routes all exits through state.resolve
+      // or state.reject — this ensures no listener leak across retries.
+      const origResolve = state.resolve;
+      const origReject = state.reject;
+      state.resolve = (value: boolean) => {
+        clearTimeout(timeout);
+        opts?.signal?.removeEventListener('abort', onAbort);
+        origResolve(value);
+      };
+      state.reject = (err: Error) => {
+        clearTimeout(timeout);
+        opts?.signal?.removeEventListener('abort', onAbort);
+        origReject(err);
+      };
+
+      // Store timeout and socket so setupRequesterSocketHandlers can clear them
       (state as any).timeout = timeout;
       (state as any).socket = socket;
     });

@@ -1,12 +1,42 @@
 /**
  * BLAKE3 Content Hashing Pipeline
  * PRD Section 6.1 - Content Addressing
+ *
+ * Uses a lazy loader to avoid top-level native imports.
+ * Tries native blake3 first, falls back to blake3-wasm.
+ * Call ensureBlake3() once at startup before using sync functions.
  */
 
-import { createHash } from 'blake3';
-import { createReadStream, statSync } from 'fs';
+import { createReadStream } from 'fs';
 import { stat } from 'fs/promises';
 import type { ContentHash } from '../types.js';
+
+// Lazy-loaded createHash reference (initialized on first use)
+let _createHash: (() => { update(data: Uint8Array | Buffer): void; digest(encoding: 'hex'): string }) | null = null;
+
+/**
+ * Initialize blake3 (native or wasm fallback). Safe to call multiple times.
+ * Must be called before any sync hashing functions (hashBytes, hashString,
+ * StreamingHasher, ChunkHasher). Async functions call this internally.
+ */
+export async function ensureBlake3(): Promise<void> {
+  if (_createHash) return;
+  try {
+    const mod = await import('blake3');
+    _createHash = mod.createHash;
+  } catch {
+    const mod = await import('blake3-wasm');
+    _createHash = mod.createHash;
+  }
+}
+
+/**
+ * Get the loaded createHash function. Throws if ensureBlake3() hasn't been called.
+ */
+function getCreateHash() {
+  if (!_createHash) throw new Error('blake3 not initialized. Call ensureBlake3() first.');
+  return _createHash;
+}
 
 /**
  * Hash file metadata for cache invalidation
@@ -61,6 +91,8 @@ function cacheHash(meta: FileHashMeta): void {
  * Uses streaming for memory efficiency with large files
  */
 export async function hashFile(filePath: string): Promise<ContentHash> {
+  await ensureBlake3();
+
   const stats = await stat(filePath);
   const size = stats.size;
   const mtime = stats.mtimeMs;
@@ -90,7 +122,7 @@ export async function hashFile(filePath: string): Promise<ContentHash> {
  */
 async function computeFileHash(filePath: string): Promise<ContentHash> {
   return new Promise((resolve, reject) => {
-    const hash = createHash();
+    const hash = getCreateHash()();
     const stream = createReadStream(filePath);
 
     stream.on('data', (chunk: Buffer | string) => {
@@ -112,15 +144,17 @@ async function computeFileHash(filePath: string): Promise<ContentHash> {
 
 /**
  * Compute BLAKE3 hash of bytes (for small data)
+ * Requires ensureBlake3() to have been called.
  */
 export function hashBytes(data: Uint8Array): ContentHash {
-  const hash = createHash();
+  const hash = getCreateHash()();
   hash.update(data);
   return hash.digest('hex');
 }
 
 /**
  * Compute BLAKE3 hash of a string
+ * Requires ensureBlake3() to have been called.
  */
 export function hashString(data: string): ContentHash {
   return hashBytes(Buffer.from(data, 'utf-8'));
@@ -140,9 +174,10 @@ export async function verifyFileHash(
 /**
  * Streaming hasher for download verification
  * Supports chunk-by-chunk hashing during download
+ * Requires ensureBlake3() to have been called.
  */
 export class StreamingHasher {
-  private hash = createHash();
+  private hash = getCreateHash()();
   private bytesProcessed = 0;
 
   /**
@@ -178,6 +213,7 @@ export class StreamingHasher {
 /**
  * Chunk hasher for partial verification during download
  * Hashes each chunk independently for early failure detection
+ * Requires ensureBlake3() to have been called.
  */
 export class ChunkHasher {
   private chunkSize: number;

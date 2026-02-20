@@ -44,6 +44,7 @@ export {
   hashBytes,
   hashString,
   verifyFileHash,
+  ensureBlake3,
   StreamingHasher,
   ChunkHasher,
   type FileHashMeta,
@@ -64,6 +65,9 @@ export {
   verifyTombstoneMessage,
   verifyCollectionSignature,
 } from './publish/publisher.js';
+
+// High-level facade
+export { OverlayClient, type OverlayClientOptions } from './overlay-client.js';
 
 // Transport
 export { DirectTransport } from './transport/direct.js';
