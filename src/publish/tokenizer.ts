@@ -255,6 +255,11 @@ export function getRarestToken(tokens: string[]): string | null {
   });
 }
 
+/** Extensions from temp/partial downloads that pollute stats */
+const TEMP_EXTENSIONS = new Set([
+  'aria2', 'part', 'crdownload', 'download', 'tmp', 'temp', 'bak', 'swp',
+]);
+
 /**
  * Parse file extension from filename
  */
@@ -264,20 +269,13 @@ export function parseExtension(filename: string): FileExtension {
 
   const ext = match[1].toLowerCase();
 
-  // Map to known extensions
-  const knownExts: Record<string, FileExtension> = {
-    'mp3': 'mp3', 'flac': 'flac', 'wav': 'wav', 'aac': 'aac',
-    'ogg': 'ogg', 'opus': 'opus', 'wma': 'wma', 'm4a': 'm4a', 'aiff': 'aiff',
-    'mp4': 'mp4', 'mkv': 'mkv', 'avi': 'avi', 'mov': 'mov',
-    'wmv': 'wmv', 'webm': 'webm',
-    'jpg': 'jpg', 'jpeg': 'jpeg', 'png': 'png', 'gif': 'gif',
-    'webp': 'webp', 'bmp': 'bmp', 'tiff': 'tiff',
-    'pdf': 'pdf', 'epub': 'epub', 'mobi': 'mobi', 'txt': 'txt',
-    'doc': 'doc', 'docx': 'docx',
-    'zip': 'zip', 'rar': 'rar', '7z': '7z', 'tar': 'tar', 'gz': 'gz',
-  };
+  // Must be 1-10 alphanumeric chars to be a valid extension
+  if (!/^[a-z0-9]{1,10}$/.test(ext)) return 'other';
 
-  return knownExts[ext] || 'other';
+  // Collapse temp/partial download extensions to "other"
+  if (TEMP_EXTENSIONS.has(ext)) return 'other';
+
+  return ext;
 }
 
 /**

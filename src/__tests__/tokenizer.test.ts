@@ -10,6 +10,7 @@ import {
   isStopword,
   getRarestToken,
   calculateTokenScore,
+  parseExtension,
 } from '../publish/tokenizer.js';
 
 describe('Tokenizer', () => {
@@ -103,6 +104,50 @@ describe('Tokenizer', () => {
 
     it('should handle empty array', () => {
       expect(getRarestToken([])).toBeNull();
+    });
+  });
+
+  describe('parseExtension', () => {
+    it('should return known extensions unchanged', () => {
+      expect(parseExtension('song.mp3')).toBe('mp3');
+      expect(parseExtension('image.png')).toBe('png');
+      expect(parseExtension('archive.zip')).toBe('zip');
+      expect(parseExtension('video.mkv')).toBe('mkv');
+    });
+
+    it('should return unknown extensions raw instead of "other"', () => {
+      expect(parseExtension('track.cue')).toBe('cue');
+      expect(parseExtension('info.nfo')).toBe('nfo');
+      expect(parseExtension('playlist.m3u')).toBe('m3u');
+      expect(parseExtension('checksum.sfv')).toBe('sfv');
+      expect(parseExtension('subtitles.srt')).toBe('srt');
+      expect(parseExtension('data.log')).toBe('log');
+    });
+
+    it('should return "other" for files with no extension', () => {
+      expect(parseExtension('README')).toBe('other');
+      expect(parseExtension('Makefile')).toBe('other');
+    });
+
+    it('should collapse temp/partial download extensions to "other"', () => {
+      expect(parseExtension('file.aria2')).toBe('other');
+      expect(parseExtension('file.part')).toBe('other');
+      expect(parseExtension('file.crdownload')).toBe('other');
+      expect(parseExtension('file.tmp')).toBe('other');
+      expect(parseExtension('file.bak')).toBe('other');
+      expect(parseExtension('file.swp')).toBe('other');
+    });
+
+    it('should return "other" for invalid extensions', () => {
+      expect(parseExtension('file.a b')).toBe('other'); // space
+      expect(parseExtension('file.thisnameiswaytoolong')).toBe('other'); // >10 chars
+      expect(parseExtension('file.hello world')).toBe('other'); // space
+    });
+
+    it('should be case-insensitive', () => {
+      expect(parseExtension('song.MP3')).toBe('mp3');
+      expect(parseExtension('image.PNG')).toBe('png');
+      expect(parseExtension('info.NFO')).toBe('nfo');
     });
   });
 

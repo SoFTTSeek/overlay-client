@@ -35,7 +35,8 @@ export const FILE_EXTENSIONS = [
   'other'
 ] as const;
 
-export type FileExtension = typeof FILE_EXTENSIONS[number];
+export type KnownFileExtension = (typeof FILE_EXTENSIONS)[number];
+export type FileExtension = KnownFileExtension | (string & {});
 
 // ============================================
 // Posting Types (PRD Section 5.2)
