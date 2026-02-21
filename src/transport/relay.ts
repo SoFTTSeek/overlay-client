@@ -52,6 +52,12 @@ interface ProviderRegistrationState {
   relayUrl: string;
   connected: boolean;
   reconnectTimer?: NodeJS.Timeout;
+  reconnectAttempt: number;
+  registerAck?: {
+    resolve: () => void;
+    reject: (error: Error) => void;
+    timer: NodeJS.Timeout;
+  };
   providedFiles: Map<ContentHash, string>; // contentHash -> filePath
 }
 
@@ -105,6 +111,8 @@ export class RelayTransport extends EventEmitter {
   private connectionTimeout: number = 30000;
   private providerRegistration: ProviderRegistrationState | null = null;
   private reconnectDelayMs: number = 5000;
+  private maxReconnectDelayMs: number = 60000;
+  private providerConnectPromise: Promise<void> | null = null;
   private browseRequestHandler: BrowseRequestHandler | null = null;
   private directMessageHandler: DirectMessageHandler | null = null;
 
@@ -130,6 +138,25 @@ export class RelayTransport extends EventEmitter {
     return { host, port: parseInt(portStr || '9000', 10) };
   }
 
+  private getRelayCandidates(preferredRelay?: string): string[] {
+    const candidates: string[] = [];
+    const seen = new Set<string>();
+
+    const add = (relayUrl?: string) => {
+      if (!relayUrl || seen.has(relayUrl)) return;
+      seen.add(relayUrl);
+      candidates.push(relayUrl);
+    };
+
+    add(preferredRelay);
+    add(this.providerRegistration?.relayUrl);
+    for (const relayUrl of this.relayUrls) {
+      add(relayUrl);
+    }
+
+    return candidates;
+  }
+
   /**
    * Connect to a relay server
    * @param relayUrl - URL of the relay server
@@ -140,6 +167,8 @@ export class RelayTransport extends EventEmitter {
       const { host, port } = this.parseRelayUrl(relayUrl);
 
       const socket = createConnection({ host, port }, () => {
+        socket.setKeepAlive(true, 15000);
+        socket.setNoDelay(true);
         // Disable timeout for persistent connections (providers stay connected)
         if (persistent) {
           socket.setTimeout(0);
@@ -238,42 +267,38 @@ export class RelayTransport extends EventEmitter {
     };
     writeFrame(socket, Buffer.from(JSON.stringify(hello)));
 
-    return new Promise(async (resolve, reject) => {
-      try {
-        // Wait a moment for relay to pair
-        await new Promise(r => setTimeout(r, 500));
+    // Wait a moment for relay to pair before sending data.
+    await new Promise((resolve) => setTimeout(resolve, 500));
 
-        // Get file stats
-        const stats = await stat(filePath);
+    // Get file stats
+    const stats = await stat(filePath);
 
-        // Send metadata frame
-        const metadata = {
-          type: 'METADATA',
-          contentHash,
-          size: stats.size,
-        };
-        writeFrame(socket, Buffer.from(JSON.stringify(metadata)));
+    // Send metadata frame
+    const metadata = {
+      type: 'METADATA',
+      contentHash,
+      size: stats.size,
+    };
+    writeFrame(socket, Buffer.from(JSON.stringify(metadata)));
 
-        // Stream file data
-        const stream = createReadStream(filePath, { highWaterMark: 64 * 1024 });
+    // Stream file data
+    return new Promise((resolve, reject) => {
+      const stream = createReadStream(filePath, { highWaterMark: 64 * 1024 });
 
-        stream.on('data', (chunk: Buffer | string) => {
-          const bufferChunk = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
-          writeFrame(socket, bufferChunk);
-        });
+      stream.on('data', (chunk: Buffer | string) => {
+        const bufferChunk = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
+        writeFrame(socket, bufferChunk);
+      });
 
-        stream.on('end', () => {
-          // Send completion marker
-          writeFrame(socket, Buffer.from(JSON.stringify({ type: 'COMPLETE' })));
-          resolve(true);
-        });
+      stream.on('end', () => {
+        // Send completion marker
+        writeFrame(socket, Buffer.from(JSON.stringify({ type: 'COMPLETE' })));
+        resolve(true);
+      });
 
-        stream.on('error', (err) => {
-          reject(err);
-        });
-      } catch (err) {
+      stream.on('error', (err) => {
         reject(err);
-      }
+      });
     });
   }
 
@@ -402,6 +427,21 @@ export class RelayTransport extends EventEmitter {
    */
   updateRelays(relayUrls: string[]): void {
     this.relayUrls = relayUrls;
+    if (!this.providerRegistration) return;
+
+    if (relayUrls.length === 0) {
+      this.unregisterProvider();
+      return;
+    }
+
+    if (!relayUrls.includes(this.providerRegistration.relayUrl)) {
+      this.providerRegistration.connected = false;
+      if (this.providerRegistration.socket && !this.providerRegistration.socket.destroyed) {
+        this.providerRegistration.socket.destroy();
+      }
+      this.providerRegistration.relayUrl = relayUrls[0];
+      this.scheduleProviderReconnect();
+    }
   }
 
   /**
@@ -420,12 +460,26 @@ export class RelayTransport extends EventEmitter {
     providedFiles: Map<ContentHash, string>,
     relayUrl?: string
   ): Promise<void> {
-    const selectedRelay = relayUrl || this.relayUrls[0];
+    const selectedRelay = relayUrl || this.getRelayCandidates()[0];
     if (!selectedRelay) {
       throw new Error('No relay servers available');
     }
 
-    // Clean up existing registration if any
+    // Fast path: already registered for this pubKey/relay, just update files.
+    if (
+      this.providerRegistration
+      && this.providerRegistration.pubKey === pubKey
+      && this.providerRegistration.relayUrl === selectedRelay
+    ) {
+      this.providerRegistration.providedFiles = providedFiles;
+      if (this.providerRegistration.connected) {
+        return;
+      }
+      await this.connectAsProvider();
+      return;
+    }
+
+    // Clean up existing registration if switching pubKey or relay.
     if (this.providerRegistration) {
       this.unregisterProvider();
     }
@@ -435,6 +489,7 @@ export class RelayTransport extends EventEmitter {
       socket: null as any, // Will be set below
       relayUrl: selectedRelay,
       connected: false,
+      reconnectAttempt: 0,
       providedFiles,
     };
 
@@ -446,29 +501,95 @@ export class RelayTransport extends EventEmitter {
    */
   private async connectAsProvider(): Promise<void> {
     if (!this.providerRegistration) return;
-
-    try {
-      // Use persistent=true to disable timeout for long-lived provider connections
-      const socket = await this.connectToRelay(this.providerRegistration.relayUrl, true);
-      this.providerRegistration.socket = socket;
-      this.providerRegistration.connected = true;
-
-      // Send PROVIDER_REGISTER
-      const register = {
-        type: 'PROVIDER_REGISTER',
-        pubKey: this.providerRegistration.pubKey,
-      };
-      writeFrame(socket, Buffer.from(JSON.stringify(register)));
-
-      // Set up handlers
-      this.setupProviderSocketHandlers(socket);
-
-      console.log(`Registered as provider with relay: ${this.providerRegistration.pubKey.slice(0, 16)}...`);
-      this.emit('provider:registered', { relayUrl: this.providerRegistration.relayUrl });
-    } catch (err) {
-      console.error('Failed to connect to relay as provider:', err);
-      this.scheduleProviderReconnect();
+    if (this.providerConnectPromise) {
+      return this.providerConnectPromise;
     }
+
+    this.providerConnectPromise = (async () => {
+      if (!this.providerRegistration) return;
+
+      const candidates = this.getRelayCandidates(this.providerRegistration.relayUrl);
+      let lastError: Error | null = null;
+
+      for (const relayUrl of candidates) {
+        if (!this.providerRegistration) return;
+
+        try {
+          // Use persistent=true to disable timeout for long-lived provider connections
+          const socket = await this.connectToRelay(relayUrl, true);
+          this.providerRegistration.socket = socket;
+          this.providerRegistration.connected = false;
+          this.providerRegistration.relayUrl = relayUrl;
+
+          // Set up handlers before sending register so ACK is captured.
+          this.setupProviderSocketHandlers(socket);
+
+          // Send PROVIDER_REGISTER
+          const register = {
+            type: 'PROVIDER_REGISTER',
+            pubKey: this.providerRegistration.pubKey,
+          };
+          writeFrame(socket, Buffer.from(JSON.stringify(register)));
+
+          // Wait for relay ACK before marking connected.
+          await new Promise<void>((resolve, reject) => {
+            const timer = setTimeout(() => {
+              reject(new Error('Provider registration ACK timeout'));
+            }, 10000);
+
+            if (!this.providerRegistration || this.providerRegistration.socket !== socket) {
+              clearTimeout(timer);
+              reject(new Error('Provider registration state changed'));
+              return;
+            }
+
+            this.providerRegistration.registerAck = {
+              resolve: () => {
+                clearTimeout(timer);
+                resolve();
+              },
+              reject: (error: Error) => {
+                clearTimeout(timer);
+                reject(error);
+              },
+              timer,
+            };
+          });
+
+          if (!this.providerRegistration || this.providerRegistration.socket !== socket) {
+            return;
+          }
+
+          this.providerRegistration.connected = true;
+          this.providerRegistration.reconnectAttempt = 0;
+          this.providerRegistration.registerAck = undefined;
+
+          console.log(`Registered as provider with relay: ${this.providerRegistration.pubKey.slice(0, 16)}...`);
+          this.emit('provider:registered', { relayUrl: this.providerRegistration.relayUrl });
+          return;
+        } catch (err) {
+          lastError = err instanceof Error ? err : new Error(String(err));
+          console.error(`Failed to connect to relay ${relayUrl} as provider:`, lastError.message);
+
+          if (this.providerRegistration?.socket && !this.providerRegistration.socket.destroyed) {
+            this.providerRegistration.socket.destroy();
+          }
+          if (this.providerRegistration) {
+            this.providerRegistration.connected = false;
+            this.providerRegistration.registerAck = undefined;
+          }
+        }
+      }
+
+      if (lastError) {
+        console.error('Failed to connect to relay as provider:', lastError.message);
+      }
+      this.scheduleProviderReconnect();
+    })().finally(() => {
+      this.providerConnectPromise = null;
+    });
+
+    return this.providerConnectPromise;
   }
 
   /**
@@ -490,12 +611,23 @@ export class RelayTransport extends EventEmitter {
 
     socket.on('error', (err) => {
       console.error('Provider relay socket error:', err.message);
-      // Don't trigger reconnect here - 'close' event will handle it
+      if (this.providerRegistration?.socket === socket) {
+        this.providerRegistration.connected = false;
+        if (this.providerRegistration.registerAck) {
+          this.providerRegistration.registerAck.reject(new Error(`Provider relay socket error: ${err.message}`));
+          this.providerRegistration.registerAck = undefined;
+        }
+      }
+      // Don't trigger reconnect here - 'close' event will handle it.
     });
 
     socket.on('close', () => {
-      if (this.providerRegistration) {
+      if (this.providerRegistration?.socket === socket) {
         this.providerRegistration.connected = false;
+        if (this.providerRegistration.registerAck) {
+          this.providerRegistration.registerAck.reject(new Error('Provider relay connection closed before registration ACK'));
+          this.providerRegistration.registerAck = undefined;
+        }
         console.log('Provider relay connection closed, reconnecting...');
         this.scheduleProviderReconnect();
       }
@@ -517,6 +649,9 @@ export class RelayTransport extends EventEmitter {
 
       if (msg.type === 'PROVIDER_REGISTERED') {
         console.log('Provider registration confirmed by relay');
+        if (this.providerRegistration?.socket === socket && this.providerRegistration.registerAck) {
+          this.providerRegistration.registerAck.resolve();
+        }
         return;
       }
 
@@ -711,11 +846,17 @@ export class RelayTransport extends EventEmitter {
       clearTimeout(this.providerRegistration.reconnectTimer);
     }
 
+    const attempt = this.providerRegistration.reconnectAttempt;
+    const backoff = Math.min(this.reconnectDelayMs * (2 ** attempt), this.maxReconnectDelayMs);
+    const jitter = Math.floor(Math.random() * 1000);
+    const delayMs = backoff + jitter;
+    this.providerRegistration.reconnectAttempt += 1;
+
     this.providerRegistration.reconnectTimer = setTimeout(() => {
       if (this.providerRegistration && !this.providerRegistration.connected) {
-        this.connectAsProvider();
+        void this.connectAsProvider();
       }
-    }, this.reconnectDelayMs);
+    }, delayMs);
   }
 
   /**
@@ -728,11 +869,17 @@ export class RelayTransport extends EventEmitter {
       clearTimeout(this.providerRegistration.reconnectTimer);
     }
 
+    if (this.providerRegistration.registerAck) {
+      this.providerRegistration.registerAck.reject(new Error('Provider unregistered'));
+      this.providerRegistration.registerAck = undefined;
+    }
+
     if (this.providerRegistration.socket && !this.providerRegistration.socket.destroyed) {
       this.providerRegistration.socket.destroy();
     }
 
     this.providerRegistration = null;
+    this.providerConnectPromise = null;
     this.emit('provider:unregistered');
   }
 
@@ -762,8 +909,8 @@ export class RelayTransport extends EventEmitter {
     destPath: string,
     relayUrl?: string
   ): Promise<boolean> {
-    const selectedRelay = relayUrl || this.relayUrls[0];
-    if (!selectedRelay) {
+    const relayCandidates = this.getRelayCandidates(relayUrl);
+    if (relayCandidates.length === 0) {
       throw new Error('No relay servers available');
     }
 
@@ -774,11 +921,37 @@ export class RelayTransport extends EventEmitter {
     // exists, silently dropping file chunks.
     await mkdir(dirname(destPath), { recursive: true });
 
+    const errors: string[] = [];
+    for (const candidate of relayCandidates) {
+      try {
+        return await this.requestFileFromProviderViaRelay(
+          contentHash,
+          providerPubKey,
+          destPath,
+          candidate,
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        errors.push(`${candidate}: ${message}`);
+        // Ensure retries always start clean, even if the previous attempt left a partial file.
+        await unlink(destPath).catch(() => {});
+      }
+    }
+
+    throw new Error(`Relay file request failed on all relays: ${errors.join('; ')}`);
+  }
+
+  private async requestFileFromProviderViaRelay(
+    contentHash: ContentHash,
+    providerPubKey: string,
+    destPath: string,
+    relayUrl: string,
+  ): Promise<boolean> {
     // Connect to relay - use persistent=true to disable the 30s socket timeout
     // The transfer has its own 120s timeout, we don't want the socket timeout killing it
-    const socket = await this.connectToRelay(selectedRelay, true);
+    const socket = await this.connectToRelay(relayUrl, true);
 
-    return new Promise(async (resolve, reject) => {
+    return new Promise((resolve, reject) => {
       const state: RelayConnectionState = {
         sessionId: `${providerPubKey}:${contentHash}:${Date.now()}`,
         role: 'requester',
@@ -1090,82 +1263,106 @@ export class RelayTransport extends EventEmitter {
     relayUrl: string,
     message: DirectMessage
   ): Promise<DirectMessageAck> {
-    const selectedRelay = relayUrl || this.relayUrls[0];
-    if (!selectedRelay) {
+    const relayCandidates = this.getRelayCandidates(relayUrl);
+    if (relayCandidates.length === 0) {
       throw new Error('No relay URLs configured');
     }
 
     console.log('Sending direct message via relay to:', targetPubKey.slice(0, 16));
 
-    return new Promise(async (resolve, reject) => {
+    const errors: string[] = [];
+    for (const candidate of relayCandidates) {
       try {
-        // Connect to relay
-        const socket = await this.connectToRelay(selectedRelay, true);
-
-        // Set timeout for ACK response
-        const timeout = setTimeout(() => {
-          socket.destroy();
-          reject(new Error('Direct message via relay timed out'));
-        }, 30000);
-
-        let buffer = Buffer.alloc(0);
-
-        socket.on('data', (data: Buffer) => {
-          buffer = Buffer.concat([buffer, data]);
-          const { frames, remaining } = parseFrames(buffer);
-          buffer = Buffer.from(remaining);
-
-          for (const frame of frames) {
-            try {
-              const msg = JSON.parse(frame.toString());
-
-              if (msg.type === 'ERROR') {
-                clearTimeout(timeout);
-                socket.destroy();
-                reject(new Error(msg.error || 'Direct message failed'));
-                return;
-              }
-
-              if (msg.type === 'DIRECT_MESSAGE_RESPONSE' && msg.directMessageAck) {
-                // Verify ACK matches the message we sent
-                if (msg.directMessageAck.messageId !== message.messageId) {
-                  console.log('Relay direct message: Ignoring ACK for wrong messageId:', msg.directMessageAck.messageId?.slice(0, 16));
-                  continue;
-                }
-                clearTimeout(timeout);
-                socket.destroy();
-                console.log('Relay direct message: Received ACK:', msg.directMessageAck.status);
-                resolve(msg.directMessageAck as DirectMessageAck);
-                return;
-              }
-            } catch (err) {
-              console.log('Relay direct message: Frame parse error:', err);
-            }
-          }
-        });
-
-        socket.on('error', (err) => {
-          clearTimeout(timeout);
-          reject(err);
-        });
-
-        socket.on('close', () => {
-          clearTimeout(timeout);
-          reject(new Error('Relay connection closed before receiving ACK'));
-        });
-
-        // Send RELAY_DIRECT_MESSAGE
-        const request = {
-          type: 'RELAY_DIRECT_MESSAGE',
-          providerPubKey: targetPubKey,
-          directMessage: message,
-        };
-        writeFrame(socket, Buffer.from(JSON.stringify(request)));
-        console.log('Relay direct message: Sent RELAY_DIRECT_MESSAGE');
-
+        return await this.sendDirectMessageViaRelay(candidate, targetPubKey, message);
       } catch (err) {
-        reject(err);
+        const messageText = err instanceof Error ? err.message : String(err);
+        errors.push(`${candidate}: ${messageText}`);
       }
+    }
+
+    throw new Error(`Direct message failed on all relays: ${errors.join('; ')}`);
+  }
+
+  private async sendDirectMessageViaRelay(
+    relayUrl: string,
+    targetPubKey: PublicKeyHex,
+    message: DirectMessage,
+  ): Promise<DirectMessageAck> {
+    const socket = await this.connectToRelay(relayUrl, true);
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+
+      // Set timeout for ACK response
+      const timeout = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        reject(new Error('Direct message via relay timed out'));
+      }, 30000);
+
+      let buffer = Buffer.alloc(0);
+
+      socket.on('data', (data: Buffer) => {
+        buffer = Buffer.concat([buffer, data]);
+        const { frames, remaining } = parseFrames(buffer);
+        buffer = Buffer.from(remaining);
+
+        for (const frame of frames) {
+          try {
+            const msg = JSON.parse(frame.toString());
+
+            if (msg.type === 'ERROR') {
+              if (settled) return;
+              settled = true;
+              clearTimeout(timeout);
+              socket.destroy();
+              reject(new Error(msg.error || 'Direct message failed'));
+              return;
+            }
+
+            if (msg.type === 'DIRECT_MESSAGE_RESPONSE' && msg.directMessageAck) {
+              // Verify ACK matches the message we sent
+              if (msg.directMessageAck.messageId !== message.messageId) {
+                console.log('Relay direct message: Ignoring ACK for wrong messageId:', msg.directMessageAck.messageId?.slice(0, 16));
+                continue;
+              }
+              if (settled) return;
+              settled = true;
+              clearTimeout(timeout);
+              socket.destroy();
+              console.log('Relay direct message: Received ACK:', msg.directMessageAck.status);
+              resolve(msg.directMessageAck as DirectMessageAck);
+              return;
+            }
+          } catch (err) {
+            console.log('Relay direct message: Frame parse error:', err);
+          }
+        }
+      });
+
+      socket.on('error', (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        reject(err);
+      });
+
+      socket.on('close', () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        reject(new Error('Relay connection closed before receiving ACK'));
+      });
+
+      // Send RELAY_DIRECT_MESSAGE
+      const request = {
+        type: 'RELAY_DIRECT_MESSAGE',
+        providerPubKey: targetPubKey,
+        directMessage: message,
+      };
+      writeFrame(socket, Buffer.from(JSON.stringify(request)));
+      console.log('Relay direct message: Sent RELAY_DIRECT_MESSAGE');
     });
   }
 
@@ -1177,78 +1374,103 @@ export class RelayTransport extends EventEmitter {
     providerPubKey: PublicKeyHex,
     browseRequest: BrowseRequestMessage
   ): Promise<BrowseResponseMessage> {
-    if (this.relayUrls.length === 0) {
+    const relayCandidates = this.getRelayCandidates();
+    if (relayCandidates.length === 0) {
       throw new Error('No relay URLs configured');
     }
 
-    const selectedRelay = this.relayUrls[0];
     console.log('Sending browse request via relay to provider:', providerPubKey.slice(0, 16));
 
-    return new Promise(async (resolve, reject) => {
+    const errors: string[] = [];
+    for (const candidate of relayCandidates) {
       try {
-        // Connect to relay - use persistent=true to disable socket timeout
-        const socket = await this.connectToRelay(selectedRelay, true);
-
-        // Set timeout for browse response
-        const timeout = setTimeout(() => {
-          socket.destroy();
-          reject(new Error('Browse request via relay timed out'));
-        }, 30000);
-
-        let buffer = Buffer.alloc(0);
-
-        socket.on('data', (data: Buffer) => {
-          buffer = Buffer.concat([buffer, data]);
-          const { frames, remaining } = parseFrames(buffer);
-          buffer = Buffer.from(remaining);
-
-          for (const frame of frames) {
-            try {
-              const msg = JSON.parse(frame.toString());
-              console.log('Relay browse: Received message type:', msg.type);
-
-              if (msg.type === 'ERROR') {
-                clearTimeout(timeout);
-                socket.destroy();
-                reject(new Error(msg.error || 'Browse request failed'));
-                return;
-              }
-
-              if (msg.type === 'BROWSE_RESPONSE' && msg.browseResponse) {
-                clearTimeout(timeout);
-                socket.destroy();
-                console.log('Relay browse: Received response with', msg.browseResponse.files?.length || 0, 'files');
-                resolve(msg.browseResponse);
-                return;
-              }
-            } catch (err) {
-              console.log('Relay browse: Frame parse error:', err);
-            }
-          }
-        });
-
-        socket.on('error', (err) => {
-          clearTimeout(timeout);
-          reject(err);
-        });
-
-        socket.on('close', () => {
-          clearTimeout(timeout);
-          // Only reject if not already resolved
-        });
-
-        // Send RELAY_BROWSE_REQUEST
-        const request = {
-          type: 'RELAY_BROWSE_REQUEST',
-          providerPubKey,
-          browseRequest,
-        };
-        writeFrame(socket, Buffer.from(JSON.stringify(request)));
-        console.log('Relay browse: Sent RELAY_BROWSE_REQUEST');
-
+        return await this.sendBrowseRequestViaRelay(candidate, providerPubKey, browseRequest);
       } catch (err) {
-        reject(err);
+        const messageText = err instanceof Error ? err.message : String(err);
+        errors.push(`${candidate}: ${messageText}`);
       }
+    }
+
+    throw new Error(`Browse request failed on all relays: ${errors.join('; ')}`);
+  }
+
+  private async sendBrowseRequestViaRelay(
+    relayUrl: string,
+    providerPubKey: PublicKeyHex,
+    browseRequest: BrowseRequestMessage,
+  ): Promise<BrowseResponseMessage> {
+    // Connect to relay - use persistent=true to disable socket timeout
+    const socket = await this.connectToRelay(relayUrl, true);
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+
+      // Set timeout for browse response
+      const timeout = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        reject(new Error('Browse request via relay timed out'));
+      }, 30000);
+
+      let buffer = Buffer.alloc(0);
+
+      socket.on('data', (data: Buffer) => {
+        buffer = Buffer.concat([buffer, data]);
+        const { frames, remaining } = parseFrames(buffer);
+        buffer = Buffer.from(remaining);
+
+        for (const frame of frames) {
+          try {
+            const msg = JSON.parse(frame.toString());
+            console.log('Relay browse: Received message type:', msg.type);
+
+            if (msg.type === 'ERROR') {
+              if (settled) return;
+              settled = true;
+              clearTimeout(timeout);
+              socket.destroy();
+              reject(new Error(msg.error || 'Browse request failed'));
+              return;
+            }
+
+            if (msg.type === 'BROWSE_RESPONSE' && msg.browseResponse) {
+              if (settled) return;
+              settled = true;
+              clearTimeout(timeout);
+              socket.destroy();
+              console.log('Relay browse: Received response with', msg.browseResponse.files?.length || 0, 'files');
+              resolve(msg.browseResponse);
+              return;
+            }
+          } catch (err) {
+            console.log('Relay browse: Frame parse error:', err);
+          }
+        }
+      });
+
+      socket.on('error', (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        reject(err);
+      });
+
+      socket.on('close', () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        reject(new Error('Relay connection closed before receiving browse response'));
+      });
+
+      // Send RELAY_BROWSE_REQUEST
+      const request = {
+        type: 'RELAY_BROWSE_REQUEST',
+        providerPubKey,
+        browseRequest,
+      };
+      writeFrame(socket, Buffer.from(JSON.stringify(request)));
+      console.log('Relay browse: Sent RELAY_BROWSE_REQUEST');
     });
   }
 }

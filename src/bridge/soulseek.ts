@@ -709,8 +709,7 @@ export class SoulseekBridge extends EventEmitter {
         const success = await this.relayTransport.requestFileFromProvider(
           state.result.contentHash,
           provider.pubKey,
-          writePath,
-          this.config.relayUrls[0]
+          writePath
         );
 
         const duration = Date.now() - startTime;
@@ -970,7 +969,15 @@ export class SoulseekBridge extends EventEmitter {
     }
 
     try {
-      await this.relayTransport.registerAsProvider(myPubKey, providedFiles, this.config.relayUrls[0]);
+      if (this.relayTransport.isProviderRegistered()) {
+        this.relayTransport.updateProvidedFiles(providedFiles);
+        console.log(
+          `Updated relay provider file set: ${myPubKey.slice(0, 16)}... (${providedFiles.size} files)`
+        );
+        return;
+      }
+
+      await this.relayTransport.registerAsProvider(myPubKey, providedFiles);
       console.log(`Registered with relay as provider: ${myPubKey.slice(0, 16)}... (${providedFiles.size} files)`);
     } catch (err) {
       console.error('Failed to register with relay:', err);

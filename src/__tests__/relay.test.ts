@@ -132,6 +132,41 @@ describe('RelayTransport Integration (Production RelayServer)', () => {
       providerRelay.unregisterProvider();
     }, 30000);
 
+    it('should retry file transfer on fallback relay when first relay candidate fails', async () => {
+      const testFilePath = join(testDir, 'fallback-file.bin');
+      const testFileContent = randomBytes(32 * 1024); // 32KB
+      writeFileSync(testFilePath, testFileContent);
+
+      const contentHash = await hashFile(testFilePath);
+      const destPath = join(testDir, 'fallback-file-downloaded.bin');
+
+      const providerRelay = createRelayTransport();
+      const providerPubKey = randomBytes(32).toString('hex');
+      const providedFiles = new Map<string, string>();
+      providedFiles.set(contentHash, testFilePath);
+
+      await providerRelay.registerAsProvider(providerPubKey, providedFiles);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      const unavailableRelay = `127.0.0.1:${relayPort + 1000}`;
+      const requesterRelay = new RelayTransport([unavailableRelay, `127.0.0.1:${relayPort}`]);
+      testTransports.push(requesterRelay);
+
+      const result = await requesterRelay.requestFileFromProvider(
+        contentHash,
+        providerPubKey,
+        destPath,
+        unavailableRelay,
+      );
+
+      expect(result).toBe(true);
+      expect(existsSync(destPath)).toBe(true);
+      const downloadedContent = readFileSync(destPath);
+      expect(downloadedContent.equals(testFileContent)).toBe(true);
+
+      providerRelay.unregisterProvider();
+    }, 30000);
+
     it('should transfer a large file (5MB) via relay with backpressure', async () => {
       const testFilePath = join(testDir, 'large-file.bin');
       const testFileContent = randomBytes(5 * 1024 * 1024); // 5MB
