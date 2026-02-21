@@ -1,6 +1,6 @@
 {
   "name": "@softtseek/overlay-client",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Overlay network client for SoFTTSeek",
   "type": "module",
   "main": "dist/index.js",
