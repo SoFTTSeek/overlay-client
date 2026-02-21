@@ -506,8 +506,8 @@ export interface OverlayConfig {
 export const DEFAULT_CONFIG: OverlayConfig = {
   bootstrapNodes: [],
   relayNodes: [],
-  defaultTtlMs: 24 * 60 * 60 * 1000, // 24 hours
-  refreshIntervalMs: 12 * 60 * 60 * 1000, // 12 hours
+  defaultTtlMs: 2 * 60 * 60 * 1000, // 2 hours
+  refreshIntervalMs: 30 * 60 * 1000, // 30 minutes
   presenceIntervalMs: 2 * 60 * 1000, // 2 minutes
   queryTimeoutMs: 10 * 1000, // 10 seconds
   transferTimeoutMs: 5 * 60 * 1000, // 5 minutes

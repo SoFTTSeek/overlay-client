@@ -150,6 +150,14 @@ export class OverlayClient {
       timeoutMs?: number;
     },
   ): Promise<boolean> {
+    // Pre-flight: fail fast if provider is confirmed offline
+    const status = await this.checkProviderStatus(providerPubKey);
+    if (status === 'offline') {
+      throw new Error(
+        `Provider ${providerPubKey.slice(0, 16)}... is not currently online on any relay. They need to be running SoFTTSeek to serve files.`
+      );
+    }
+
     if (opts?.onProgress) {
       const handler = (p: TransferProgress) => {
         if (p.contentHash === contentHash) opts.onProgress!(p);
@@ -231,6 +239,62 @@ export class OverlayClient {
       indexers: healthyIndexers,
       relays: this.relayNodes,
     };
+  }
+
+  /**
+   * Derive relay HTTP URL from its TCP URL.
+   * Relay TCP is e.g. "relay://178.156.231.111:9000", HTTP is port+1
+   */
+  private getRelayHttpUrl(relayTcpUrl: string): string {
+    const cleaned = relayTcpUrl.replace(/^(relay|tcp):\/\//, '');
+    const lastColon = cleaned.lastIndexOf(':');
+    if (lastColon === -1) return `http://${cleaned}:9001`;
+    const host = cleaned.substring(0, lastColon);
+    const port = parseInt(cleaned.substring(lastColon + 1), 10);
+    return `http://${host}:${port + 1}`;
+  }
+
+  /**
+   * Query all known relays for online providers.
+   * Returns a Set of provider pubkeys if at least one relay responds,
+   * or null if all relays are unreachable.
+   */
+  async getOnlineProviders(): Promise<Set<string> | null> {
+    const results = await Promise.allSettled(
+      this.relayNodes.map(async (relayUrl) => {
+        const httpUrl = this.getRelayHttpUrl(relayUrl);
+        const res = await fetch(`${httpUrl}/v1/providers/online`, {
+          signal: AbortSignal.timeout(5000),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json() as { providers: string[]; ts: number };
+        return data.providers;
+      })
+    );
+
+    const allProviders = new Set<string>();
+    let anySuccess = false;
+
+    for (const result of results) {
+      if (result.status === 'fulfilled') {
+        anySuccess = true;
+        for (const pubKey of result.value) {
+          allProviders.add(pubKey);
+        }
+      }
+    }
+
+    return anySuccess ? allProviders : null;
+  }
+
+  /**
+   * Check whether a specific provider is online.
+   * Returns 'online', 'offline', or 'unknown' (if relays are unreachable).
+   */
+  async checkProviderStatus(pubKey: string): Promise<'online' | 'offline' | 'unknown'> {
+    const online = await this.getOnlineProviders();
+    if (online === null) return 'unknown';
+    return online.has(pubKey) ? 'online' : 'offline';
   }
 
   /**

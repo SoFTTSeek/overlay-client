@@ -1075,7 +1075,14 @@ export class RelayTransport extends EventEmitter {
             state.status = 'failed';
             if ((state as any).timeout) clearTimeout((state as any).timeout);
             this.activeConnections.delete(state.sessionId);
-            state.reject(new Error(msg.error || 'Relay error'));
+            const errorMsg = msg.error || 'Relay error';
+            if (errorMsg.includes('Provider not connected')) {
+              state.reject(new Error(
+                `The peer sharing this file is not currently online. They need to be running SoFTTSeek for you to download from them. (${errorMsg})`
+              ));
+            } else {
+              state.reject(new Error(errorMsg));
+            }
             return;
           }
 
