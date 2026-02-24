@@ -103,21 +103,61 @@ export function getShardsForTokens(tokens: string[]): Set<ShardId> {
 }
 
 /**
+ * Indexer metadata with real shard ownership
+ */
+export interface IndexerInfo {
+  url: string;
+  shardStart: number;
+  shardEnd: number;
+}
+
+/**
  * Indexer selection with load balancing
  */
 export class IndexerSelector {
   private shardAssignments: Map<ShardId, string[]>;
   private indexerLoad: Map<string, number> = new Map();
   private defaultCount: number;
+  /** Real shard ranges from bootstrap (if provided) */
+  private indexerInfos: IndexerInfo[] | null = null;
 
-  constructor(indexerUrls: string[], replicationFactor: number = 5) {
-    this.shardAssignments = computeShardAssignments(indexerUrls, replicationFactor);
+  constructor(indexerUrls: string[], replicationFactor?: number);
+  constructor(indexers: IndexerInfo[], replicationFactor?: number);
+  constructor(input: string[] | IndexerInfo[], replicationFactor: number = 5) {
     this.defaultCount = replicationFactor;
 
-    // Initialize load tracking
-    for (const url of indexerUrls) {
-      this.indexerLoad.set(url, 0);
+    if (input.length > 0 && typeof input[0] === 'object') {
+      // Real shard ranges from bootstrap
+      this.indexerInfos = input as IndexerInfo[];
+      this.shardAssignments = this.buildRealAssignments(this.indexerInfos);
+      for (const info of this.indexerInfos) {
+        this.indexerLoad.set(info.url, 0);
+      }
+    } else {
+      // Legacy: URL-only mode, use synthetic assignment
+      const urls = input as string[];
+      this.indexerInfos = null;
+      this.shardAssignments = computeShardAssignments(urls, replicationFactor);
+      for (const url of urls) {
+        this.indexerLoad.set(url, 0);
+      }
     }
+  }
+
+  /**
+   * Build shard→indexer map from real shard ranges
+   */
+  private buildRealAssignments(indexers: IndexerInfo[]): Map<ShardId, string[]> {
+    const assignments = new Map<ShardId, string[]>();
+    for (let shardId = 0; shardId < TOTAL_SHARDS; shardId++) {
+      const owners = indexers
+        .filter(i => shardId >= i.shardStart && shardId <= i.shardEnd)
+        .map(i => i.url);
+      if (owners.length > 0) {
+        assignments.set(shardId, owners);
+      }
+    }
+    return assignments;
   }
 
   /**
@@ -185,6 +225,13 @@ export class IndexerSelector {
     for (const url of this.indexerLoad.keys()) {
       this.indexerLoad.set(url, 0);
     }
+  }
+
+  /**
+   * Get all known indexer URLs
+   */
+  getIndexerUrls(): string[] {
+    return Array.from(this.indexerLoad.keys());
   }
 
   /**

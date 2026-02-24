@@ -655,6 +655,11 @@ export class RelayTransport extends EventEmitter {
         return;
       }
 
+      if (msg.type === 'PING') {
+        writeFrame(socket, Buffer.from(JSON.stringify({ type: 'PONG' })));
+        return;
+      }
+
       if (msg.type === 'FILE_REQUEST' && msg.contentHash && msg.requesterSessionId) {
         console.log('Relay FILE_REQUEST received for:', msg.contentHash.slice(0, 16));
         await this.handleRelayFileRequest(socket, msg.contentHash, msg.requesterSessionId);

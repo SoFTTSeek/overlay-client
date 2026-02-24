@@ -36,7 +36,7 @@ export {
 
 // Search
 export { QueryRouter } from './search/query.js';
-export { getShardForToken, getShardTopic, groupTokensByShard, IndexerSelector } from './search/sharding.js';
+export { getShardForToken, getShardTopic, groupTokensByShard, IndexerSelector, type IndexerInfo } from './search/sharding.js';
 
 // Publishing
 export {

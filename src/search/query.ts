@@ -17,7 +17,7 @@ import type {
 } from '../types.js';
 import { DEFAULT_CONFIG } from '../types.js';
 import { tokenizeQuery, tokenizeFilename, getRarestToken, calculateTokenScore } from '../publish/tokenizer.js';
-import { IndexerSelector, getShardForToken, groupTokensByShard } from './sharding.js';
+import { IndexerSelector, getShardForToken, groupTokensByShard, type IndexerInfo } from './sharding.js';
 
 /**
  * Indexer client interface
@@ -87,11 +87,11 @@ export class QueryRouter {
   private subscriptionIndexers: Map<string, string> = new Map();
 
   constructor(
-    indexerUrls: string[],
+    indexers: string[] | IndexerInfo[],
     client?: IndexerClient,
     config?: Partial<OverlayConfig>
   ) {
-    this.selector = new IndexerSelector(indexerUrls, config?.indexerReplicationK || 5);
+    this.selector = new IndexerSelector(indexers as any, config?.indexerReplicationK || 5);
     this.client = client || new HttpIndexerClient(config?.queryTimeoutMs);
     this.config = { ...DEFAULT_CONFIG, ...config };
   }
@@ -180,13 +180,16 @@ export class QueryRouter {
       if (!result.response) continue;
 
       for (const item of result.response.results) {
-        // Verify which tokens ACTUALLY match this result's filename
+        // Verify which tokens ACTUALLY match this result's filename or folder path
         const bestProvider = item.providers[0];
         const filename = bestProvider?.filenameShort || '';
-        const filenameTokens = new Set(tokenizeFilename(filename));
+        const folder = bestProvider?.folderPath || '';
+        const filenameTokens = tokenizeFilename(filename);
+        const folderTokens = folder ? tokenizeFilename(folder) : [];
+        const allFileTokens = new Set([...filenameTokens, ...folderTokens]);
 
-        // Only count tokens that are actually in the filename
-        const verifiedMatches = queryTokens.filter(qt => filenameTokens.has(qt));
+        // Count tokens that appear in filename or folder path
+        const verifiedMatches = queryTokens.filter(qt => allFileTokens.has(qt));
 
         const existing = resultMap.get(item.contentHash);
 
@@ -214,16 +217,13 @@ export class QueryRouter {
       }
     }
 
-    // Require verified token matches based on query length
-    // Note: Files may be indexed by path tokens we can't verify from filenameShort alone
-    // - 1 token: trust indexer (token may be from path)
-    // - 2-3 tokens: require at least 1 verified match
-    // - 4+ tokens: require at least 2 verified matches
+    // AND matching (same as Soulseek): all query tokens must appear in
+    // the filename or path. For single-token queries, trust the indexer
+    // since the token may come from the folder path which filenameShort
+    // doesn't include.
     const minMatches = queryTokens.length <= 1
-      ? 0  // Trust indexer for single-token (may match path)
-      : queryTokens.length <= 3
-        ? 1
-        : 2;
+      ? 0
+      : queryTokens.length;
 
     const filtered = Array.from(resultMap.values())
       .filter(r => r.matchedTokens.size >= minMatches);
@@ -429,8 +429,15 @@ export class QueryRouter {
   /**
    * Update indexer list
    */
-  updateIndexers(indexerUrls: string[]): void {
-    this.selector = new IndexerSelector(indexerUrls, this.config.indexerReplicationK);
+  updateIndexers(indexers: string[] | IndexerInfo[]): void {
+    this.selector = new IndexerSelector(indexers as any, this.config.indexerReplicationK);
+  }
+
+  /**
+   * Get the list of indexer URLs for direct HTTP queries (e.g. browse)
+   */
+  getIndexerUrls(): string[] {
+    return this.selector.getIndexerUrls();
   }
 }
 

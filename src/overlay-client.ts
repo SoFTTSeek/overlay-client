@@ -102,7 +102,8 @@ export class OverlayClient {
           this.relay.updateRelays(this.relayNodes);
         }
 
-        this.queryRouter = new QueryRouter(this.indexerUrls);
+        // Pass full indexer metadata (with shard ranges) so routing is correct
+        this.queryRouter = new QueryRouter(data.indexers);
         return;
       } catch {
         // Try next bootstrap node
